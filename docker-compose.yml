@@ -1,6 +1,8 @@
 # chore-chart — generic Docker Compose template
 #
-# Quick start:  docker compose up -d   (state lands in ./data)
+# Quick start:  docker compose up -d   (state lands in ./data; the image
+# creates it if missing and chowns it to uid 1000). If your user id isn't
+# 1000, create ./data yourself and add `user: "UID:GID"` below.
 services:
   chore-chart:
     image: ghcr.io/josiahl06/chore-chart:latest

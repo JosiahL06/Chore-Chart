@@ -34,6 +34,7 @@ imported once on first boot and renamed to state.json.imported.
 import json
 import os
 import sqlite3
+import sys
 from contextlib import closing
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -663,7 +664,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    init_db()
+    try:
+        init_db()
+    except sqlite3.Error as exc:
+        print(
+            f"chore-chart cannot open its database: {exc}\n"
+            f"  db: {DB_FILE}\n"
+            "If the file was created by an older root-run Docker container,\n"
+            'fix its ownership once with:  sudo chown -R "$USER" data',
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
     port = int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"chore-chart server listening on :{port} (db: {DB_FILE})")

@@ -31,7 +31,7 @@ Then open **http://localhost:8080** to see the chore chart. Your data is saved i
 
 ### From source
 
-All you need is Python — there are no dependencies to install:
+All you need is Python — there are no dependencies to install. Just run these commands in your terminal:
 
 ```bash
 git clone https://github.com/JosiahL06/Chore-Chart.git
@@ -39,7 +39,13 @@ cd Chore-Chart
 HTML_DIR=$PWD/html DATA_DIR=$PWD/data python3 app/server.py
 ```
 
-Then open it at **http://localhost:8080**.
+Then open the app at **http://localhost:8080**.
+
+If the server exits with `attempt to write a readonly database`, the `data/` folder is owned by root — usually from an earlier Docker run. Fix it once:
+
+```bash
+sudo chown -R "$USER" data
+```
 
 ## Using it
 

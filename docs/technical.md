@@ -39,6 +39,8 @@ Tag pushes don't rebuild the image; they run the separate `release-notes` workfl
 
 The compose file publishes port `8080` and mounts `./data` (the SQLite database lives there); a commented block in the file shows the alternative shared-network setup (`external: frontend`) if you'd rather have a reverse proxy join the app's network directly instead of the published port. The image ships with a `HEALTHCHECK` against `GET /api/state` (defined in the Dockerfile, so compose stays clean) — `docker ps` reports healthy/unhealthy.
 
+The image doesn't run the server as root. Its entrypoint (`app/docker-entrypoint.sh`) starts as root only to `chown` the mounted `./data` — Docker creates a missing bind-mount source as `root:root`, and older images wrote root-owned files — then drops to uid 1000 via `setpriv` before exec'ing `server.py`. The server process is always unprivileged; `docker exec` still lands as root (the container's configured user), so pass `-u chore-chart` for a non-root shell. Since chowning happens at start, upgrades from root-run images and fresh installs both work without manual fixes. On a host where your uid isn't 1000, create `./data` yourself and start the container with `user: "UID:GID"` (the entrypoint skips its chown when already non-root).
+
 For local development the paths are overridable:
 
 ```bash
