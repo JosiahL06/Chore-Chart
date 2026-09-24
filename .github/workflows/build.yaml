@@ -1,0 +1,60 @@
+name: Build and Push Image
+
+# Pushes the image to ghcr.io, where a public clone can pull it: docker
+# compose defaults to this registry and the release notes' pull line names it.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'app/**'
+      - 'html/**'
+      - 'VERSION'
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image name from repo
+        run: |
+          echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Read version
+        run: |
+          VERSION="$(cat VERSION)"
+          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "VERSION file must contain exactly vMAJOR.MINOR.PATCH (got: '$VERSION')"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Building image version $VERSION"
+
+      - name: Log in to ghcr.io
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io \
+            --username '${{ github.actor }}' --password-stdin
+
+      - name: Build image
+        run: |
+          docker build \
+            -t ${{ env.IMAGE }}:latest \
+            -t ${{ env.IMAGE }}:${{ env.VERSION }} \
+            -t ${{ env.IMAGE }}:${{ github.sha }} \
+            .
+
+      - name: Push image
+        run: |
+          docker push ${{ env.IMAGE }}:latest
+          docker push ${{ env.IMAGE }}:${{ env.VERSION }}
+          docker push ${{ env.IMAGE }}:${{ github.sha }}

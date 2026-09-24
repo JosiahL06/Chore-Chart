@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Household chore chart — daily, weekly, monthly, and yearly tasks grouped by area, with checkboxes that sync across devices.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#f6f3ea">
+<title>Household Chore Chart</title>
+<link rel="icon" href="/icons/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/icons/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<header>
+  <div class="header-top">
+    <h1>Household Chore Chart</h1>
+    <button class="edit-btn" id="editBtn" type="button" onclick="toggleEdit()">Edit</button>
+  </div>
+  <div class="progress-row">
+    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="progress-label" id="progressLabel">0 / 0 done</div>
+  </div>
+</header>
+
+<div class="tabs" id="tabs"></div>
+<div id="panels"></div>
+
+<div class="reset-row">
+  <button class="reset-btn" onclick="resetGroup('daily')">Reset Daily</button>
+  <button class="reset-btn" onclick="resetGroup('weekly')">Reset Weekly</button>
+  <button class="reset-btn" onclick="resetGroup('monthly')">Reset Monthly</button>
+  <button class="reset-btn" onclick="resetGroup('yearly')">Reset Yearly</button>
+</div>
+<div class="legend">Tap a chore to check it off — your progress is saved automatically. Reset a section once that cycle's chores are done (e.g. reset Weekly every Sunday night). Use Edit to add, rename, reorder, move, or remove chores.</div>
+
+<script src="/js/app.js"></script>
+
+</body>
+</html>

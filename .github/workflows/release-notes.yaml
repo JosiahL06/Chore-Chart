@@ -1,0 +1,49 @@
+name: Publish Release Notes
+
+# A tag push (v0.2.1) publishes the matching CHANGELOG.md section as the
+# GitHub Release body via ci/publish-release.py. Kept out of build.yaml so the
+# image build stays triggered by branch pushes only.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release-notes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect the version tag
+        id: tag
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          TAG="${REF_NAME:-}"
+          case "$TAG" in
+            refs/tags/*) TAG="${TAG#refs/tags/}" ;;   # some runners return the full ref
+            refs/heads/*) TAG="" ;;
+          esac
+          case "$TAG" in v[0-9]*) ;; *) TAG="" ;; esac  # only vX.Y.Z releases
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ -n "$TAG" ]; then
+            echo "release notes will be published for $TAG"
+          else
+            echo "not a version tag push (ref=$REF) -- nothing to publish"
+          fi
+
+      - name: Check changelog has an entry for VERSION
+        run: grep -q "^## \[$(cat VERSION)\]" CHANGELOG.md
+
+      - name: Publish the CHANGELOG section as the release
+        if: ${{ steps.tag.outputs.tag != '' }}
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY: ghcr.io
+        run: python3 .ci/publish-release.py
