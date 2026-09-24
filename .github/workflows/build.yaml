@@ -40,7 +40,7 @@ jobs:
 
       - name: Log in to ghcr.io
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
           echo "$GH_TOKEN" | docker login ghcr.io \
             --username '${{ github.actor }}' --password-stdin
