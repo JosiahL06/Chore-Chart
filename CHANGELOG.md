@@ -19,6 +19,11 @@ before `v0.1.0` aren't listed — that's when versioning started.
   and older images wrote root-owned files) and then drops to an unprivileged
   uid 1000 before starting `server.py`. Fresh installs and upgrades from
   root-run images now work without a manual `chown`.
+- Added `.dockerignore` to filter out git history, documents, local databases,
+  and virtualenvs from the Docker build context.
+- Hardened the container image: application code and static assets are copied
+  as `root:root` read-only to uid 1000, and `PYTHONDONTWRITEBYTECODE=1` prevents
+  attempting to write `.pyc` caches into the container.
 - Starting the server against an unwritable database prints the path and the
   ownership fix instead of a raw traceback.
 
