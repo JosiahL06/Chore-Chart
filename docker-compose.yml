@@ -1,0 +1,12 @@
+# chore-chart — generic Docker Compose template
+#
+# Quick start:  docker compose up -d   (state lands in ./data)
+services:
+  chore-chart:
+    image: ghcr.io/josiahl06/chore-chart:latest
+    container_name: chore-chart
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
