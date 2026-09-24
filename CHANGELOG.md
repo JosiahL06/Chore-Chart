@@ -9,6 +9,19 @@ before `v0.1.0` aren't listed — that's when versioning started.
 
 ## [Unreleased]
 
+
+## [v0.2.3] - 2026-09-24
+
+### Changed
+
+- The container image no longer runs the server as root: an entrypoint chowns
+  the mounted `data/` directory (Docker creates a missing `./data` as root,
+  and older images wrote root-owned files) and then drops to an unprivileged
+  uid 1000 before starting `server.py`. Fresh installs and upgrades from
+  root-run images now work without a manual `chown`.
+- Starting the server against an unwritable database prints the path and the
+  ownership fix instead of a raw traceback.
+
 ## [v0.2.2] - 2026-09-24
 
 ### Added
