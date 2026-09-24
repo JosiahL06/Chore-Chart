@@ -16,5 +16,5 @@
 ## Housekeeping
 - [ ] Small-screen / wall-tablet layout pass.
 - [x] Add a healthcheck (`GET /api/state`) — done as a `HEALTHCHECK` in the Dockerfile so compose stays clean.
-- [x] Automate the release notes — tag pushes publish the matching `CHANGELOG.md` section as the release body via `ci/publish-release.py` (re-runs detect an already-existing release and do nothing).
+- [x] Automate the release notes — tag pushes publish the matching `CHANGELOG.md` section as the release body via `.ci/publish-release.py` (re-runs detect an already-existing release and do nothing).
 

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers match the `VERSION` file and the `:vX.Y.Z` image tag. Entries
 before `v0.1.0` aren't listed — that's when versioning started.
 
+## [Unreleased]
+
+## [v0.2.2] - 2026-09-24
+
+### Added
+
+- Public repository on GitHub: [`JosiahL06/Chore-Chart`](https://github.com/JosiahL06/Chore-Chart).
+  Releases there publish themselves from this file's matching section — each
+  with a `docker pull` line for the version's image — and CI builds
+  `ghcr.io/josiahl06/chore-chart` tagged `:latest`, `:vX.Y.Z`, and `:<git sha>`.
+
+### Changed
+
+- Docker Compose now defaults to the `ghcr.io/josiahl06/chore-chart` image;
+  set `CHORE_CHART_IMAGE` to pull from a different registry.
+- Documentation rewritten for the public repository.
+
 ## [v0.2.1] - 2026-09-24
 
 ### Added

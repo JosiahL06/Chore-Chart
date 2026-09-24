@@ -1,7 +1,7 @@
 name: Publish Release Notes
 
 # A tag push (v0.2.1) publishes the matching CHANGELOG.md section as the
-# GitHub Release body via ci/publish-release.py. Kept out of build.yaml so the
+# GitHub Release body via .ci/publish-release.py. Kept out of build.yaml so the
 # image build stays triggered by branch pushes only.
 on:
   push:
@@ -44,6 +44,6 @@ jobs:
         env:
           TAG: ${{ steps.tag.outputs.tag }}
           REPO: ${{ github.repository }}
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           REGISTRY: ghcr.io
         run: python3 .ci/publish-release.py
