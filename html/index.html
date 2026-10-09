@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Household chore chart — daily, weekly, monthly, and yearly tasks grouped by area, with checkboxes that sync across devices.">
+<meta name="description" content="Calendar-based household chore chart — day, week, and month views of recurring chores with overdue highlighting, synced across devices.">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#f6f3ea">
 <title>Household Chore Chart</title>
@@ -17,24 +17,84 @@
 <header>
   <div class="header-top">
     <h1>Household Chore Chart</h1>
-    <button class="edit-btn" id="editBtn" type="button" onclick="toggleEdit()">Edit</button>
-  </div>
-  <div class="progress-row">
-    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-    <div class="progress-label" id="progressLabel">0 / 0 done</div>
+    <div class="surface-switch" id="surfaceSwitch" role="group" aria-label="Chore chart view">
+      <button class="surface-btn" data-surface="calendar" type="button" aria-pressed="true">Calendar</button>
+      <button class="surface-btn" data-surface="chores" type="button" aria-pressed="false">Chores</button>
+    </div>
   </div>
 </header>
 
-<div class="tabs" id="tabs"></div>
-<div id="panels"></div>
+<section class="surface" id="calendarSurface">
+  <div class="cal-controls">
+    <div class="view-switch" id="viewSwitch" role="group" aria-label="Calendar range">
+      <button class="view-btn" data-view="day" type="button" aria-pressed="false">Day</button>
+      <button class="view-btn" data-view="week" type="button" aria-pressed="true">Week</button>
+      <button class="view-btn" data-view="month" type="button" aria-pressed="false">Month</button>
+    </div>
+    <div class="nav">
+      <button class="nav-btn" id="prevBtn" type="button" aria-label="Previous">&lsaquo;</button>
+      <button class="nav-btn today-btn" id="todayBtn" type="button">Today</button>
+      <button class="nav-btn" id="nextBtn" type="button" aria-label="Next">&rsaquo;</button>
+    </div>
+    <div class="range-label" id="rangeLabel"></div>
+  </div>
 
-<div class="reset-row">
-  <button class="reset-btn" onclick="resetGroup('daily')">Reset Daily</button>
-  <button class="reset-btn" onclick="resetGroup('weekly')">Reset Weekly</button>
-  <button class="reset-btn" onclick="resetGroup('monthly')">Reset Monthly</button>
-  <button class="reset-btn" onclick="resetGroup('yearly')">Reset Yearly</button>
+  <div class="overdue-banner" id="overdueBanner" hidden></div>
+
+  <main class="layout">
+    <section class="cal-pane" id="calPane" aria-label="Calendar"></section>
+    <section class="list-pane" id="listPane" aria-label="Chores for the selected day"></section>
+  </main>
+</section>
+
+<section class="surface" id="choresSurface" hidden>
+  <div class="surface-head">
+    <span class="surface-title">Routines</span>
+    <span class="surface-count" id="choreCount"></span>
+    <button class="primary-btn" id="addBtn" type="button">+ Add chore</button>
+  </div>
+  <div id="choreGroups"></div>
+</section>
+
+<div class="legend">Pick a day to check chores off, or switch to <strong>Chores</strong> to add, reschedule, reorder, or remove them.</div>
+
+<div class="scrim" id="scrim" hidden></div>
+<div class="sheet" id="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+  <div class="sheet-head">
+    <h2 id="sheetTitle">Edit chore</h2>
+    <button class="x" id="closeBtn" type="button" aria-label="Close">&times;</button>
+  </div>
+  <div class="sheet-body">
+    <label class="field">Name
+      <input id="f-name" type="text" maxlength="200" autocomplete="off">
+    </label>
+    <label class="field">Area
+      <input id="f-area" type="text" maxlength="80" list="areaOptions" autocomplete="off" placeholder="e.g. Kitchen">
+    </label>
+    <datalist id="areaOptions"></datalist>
+
+    <div class="divider-label">Schedule</div>
+    <label class="field">Repeats
+      <select id="f-freq">
+        <option value="once">Does not repeat</option>
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+        <option value="yearly">Yearly</option>
+      </select>
+    </label>
+
+    <div id="custom"></div>
+
+    <div class="editor-error" id="editorError" hidden></div>
+  </div>
+  <div class="sheet-foot">
+    <button class="danger" id="delBtn" type="button">Delete</button>
+    <div class="spacer"></div>
+    <button id="cancelBtn" type="button">Cancel</button>
+    <button class="primary" id="saveBtn" type="button">Save</button>
+  </div>
 </div>
-<div class="legend">Tap a chore to check it off — your progress is saved automatically. Reset a section once that cycle's chores are done (e.g. reset Weekly every Sunday night). Use Edit to add, rename, reorder, move, or remove chores.</div>
 
 <script src="/js/app.js"></script>
 

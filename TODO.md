@@ -1,11 +1,8 @@
 # TODO
 
 ## Short term
-- [x] **Move state to SQLite** — replace the flat `data/state.json` with a real SQLite database (via Python's stdlib `sqlite3`, so the server stays dependency-free). Safer writes, room for history/assignees later. *(Done: `data/chore.db` in WAL mode, one connection per request, transactional writes; legacy `state.json` auto-imported once and kept as `.imported`.)*
-- [x] **Edit chores from the UI** — add/rename/reorder chores in the browser instead of editing `app/chores.json`. *(Done: Edit toggle in the page header — add, rename text/area, reorder with ↑/↓, move between cycles, soft-delete via new `POST /api/chores*` endpoints; `retired_at` soft-delete keeps history, and rows now render via `textContent` so user-typed text can't inject markup.)*
-- [x] **Retire `app/chores.json`** — clutter once edits live in the UI; folded the first-run seed into `server.py` as `SEED_CHORES` and dropped `CHORES_FILE` + the Dockerfile `COPY`. *(Done: DB is the source of truth after first boot; seed order unchanged, so fresh-seed ids and the legacy `state.json` mapping still line up.)*
-- [x] **Stable chore IDs** — state is currently keyed by array position (`weekly:3`), so reordering or inserting chores shifts checkmarks. Give each chore a fixed `id` and key state by that instead. *(Done: integer primary keys; completions keyed by `chore_id` + period.)*
-- [x] **Automatic cycle resets** — reset Daily/Weekly/Monthly/Yearly on a schedule (compare a stored "last reset" date against the cycle) instead of relying on someone tapping the button. *(Done, simpler than planned: completions store the period they belong to, so stale rows stop matching when the period rolls over — no scheduler or stored reset date needed.)*
+- [x] **Calendar view** — replace the four cycle tabs with a Day/Week/Month calendar showing recurring chores and overdue in red. *(Done: month grid + week strip with per-chore dots and an overdue badge, selected day's list grouped by area, ‹/Today/› navigation, two-pane desktop / stacked mobile layout.)*
+- [x] **Per-chore recurrence** — let each chore pick its own schedule (daily/weekly/monthly/yearly, intervals, weekdays, month days) instead of a fixed cycle. *(Done: schema v2 `freq/interval/weekdays/month_days/anchor/until`, pure `due_on()` date math, in-place v1 migration that preserves checkmarks; edited via the Repeats / Every [N] [unit] / on [chips] controls.)*
 - [ ] **Basic write protection** — a shared token or reverse-proxy auth so only the household can `POST` to the API.
 
 ## Later
@@ -14,7 +11,7 @@
 - [ ] **History / streaks** — show past weeks and current streaks. *(Data already accruing since the migration: one row per chore per completed period, no timestamps — period granularity is enough. Needs a summary/charts view only.)*
 
 ## Housekeeping
-- [ ] Small-screen / wall-tablet layout pass.
+- [x] Small-screen / wall-tablet layout pass — app shell on desktop: sticky header + calendar with only the chore list scrolling, sticky day header with area headers pinned below it (groups carry bottom padding so a header never detaches early and clips), "Hide done" toggle in the day header, dot rows clamped to their column; single stacked column under 860px, tighter calendar cells under 560px. *(Verified in Chromium at 1280×800, 1280×560, 861px, 860px, 390px and 320px.)*
 - [x] Run the container as a non-root user — entrypoint (`app/docker-entrypoint.sh`) chowns `./data` then drops to uid 1000 via `setpriv`; startup now prints an ownership fix hint instead of a traceback if the DB is unwritable.
 - [x] Add a healthcheck (`GET /api/state`) — done as a `HEALTHCHECK` in the Dockerfile so compose stays clean.
 - [x] Automate the release notes — tag pushes publish the matching `CHANGELOG.md` section as the release body via `.ci/publish-release.py` (re-runs detect an already-existing release and do nothing).

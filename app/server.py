@@ -3,12 +3,17 @@
 Tiny single-file backend for the household chore chart.
 
 - Serves the static chart at /
-- GET  /api/state  -> current cycle periods + chores with completion flags
-- POST /api/toggle -> check/uncheck a single chore (idempotent row write)
-- POST /api/reset  -> clear one cycle's current-period checkmarks
-- POST /api/chores -> add a chore {"cycle", "area", "text"}
-- POST /api/chores/update  -> rename/move {"id", "area"?, "text"?, "cycle"?}
-- POST /api/chores/reorder -> set a cycle's order {"cycle", "ids"}
+- GET  /api/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD -> chores + per-date
+  occurrence flags (done / overdue) for the requested range
+- GET  /api/state  -> deprecated shim (derived from today's calendar)
+- POST /api/toggle -> check/uncheck a single chore on a date
+  {"id": 17, "done": true, "date": "2026-10-08"} (date defaults to today)
+- POST /api/reset  -> deprecated no-op shim (kept for old tabs)
+- POST /api/chores -> add a chore {"area", "text", "anchor", "freq"?,
+  "interval"?, "weekdays"?, "month_days"?, "until"?}
+- POST /api/chores/update  -> rename/reschedule {"id", "area"?, "text"?,
+  "anchor"?, "freq"?, "interval"?, "weekdays"?, "month_days"?, "until"?}
+- POST /api/chores/reorder -> set display order {"ids": [...]}
 - POST /api/chores/retire  -> soft-delete one chore {"id"} (history kept)
 - POST /api/state  -> deprecated compat shim (old flat positional dict)
 
@@ -18,15 +23,19 @@ request, a transaction around every write), so it survives container
 restarts and can't be torn by a crash mid-write like the old flat JSON
 file could.
 
-The first boot seeds chores from the built-in SEED_CHORES defaults (the
-old app/chores.json was folded in here once the UI could edit chores),
-each getting a stable integer id in seed order -- the same order the
-legacy state.json import maps positional keys onto. Completions are
-stored as one row per chore per cycle period (day / week-start / 1st of
-month / Jan 1); "done" is computed against today's period, which makes
-cycle resets automatic (a stale row from a past period simply no longer
-matches) and leaves a natural completion history behind for future stats.
+Chores carry a Tier-1 recurrence rule (once / daily / weekly / monthly /
+yearly with interval, weekday or month-day selectors, an anchor first-due
+date, and an optional until end date). Occurrences are computed on the fly
+with pure date math -- no scheduler, no pre-created instances. Completions
+are one row per chore per occurrence date; "done" means a row exists for
+that date, and "overdue" means due, before today, and with no row. Past
+rows are kept as history for future stats.
 
+Schema v2 replaced the old v1 `cycle` column (daily/weekly/monthly/yearly
+tabs) with the recurrence rule columns; the v1 calendar is gone and the
+old tab UI has been replaced by the Day/Week/Month calendar view. A v1
+database is migrated in place on boot (rules default sensibly, anchors
+land on the current period so no overdue flood appears on first open).
 A legacy /app/data/state.json (positional keys like "weekly:3") is
 imported once on first boot and renamed to state.json.imported.
 """
@@ -39,16 +48,22 @@ from contextlib import closing
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 HTML_DIR = Path(os.environ.get("HTML_DIR", "/app/html"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 
 DB_FILE = DATA_DIR / "chore.db"
 LEGACY_STATE = DATA_DIR / "state.json"
-SCHEMA_VERSION = 1
-CYCLES = ("daily", "weekly", "monthly", "yearly")
+SCHEMA_VERSION = 2
+FREQS = ("once", "daily", "weekly", "monthly", "yearly")
+# Legacy v1 cycle names, kept only for the v1 -> v2 migration and the
+# deprecated flat state.json import.
+LEGACY_CYCLES = ("daily", "weekly", "monthly", "yearly")
 MAX_AREA_LEN = 80
 MAX_TEXT_LEN = 200
+MAX_INTERVAL = 30
+CALENDAR_MAX_DAYS = 62
 
 # Content types for the static UI assets served out of HTML_DIR
 CONTENT_TYPES = {
@@ -60,101 +75,192 @@ CONTENT_TYPES = {
     ".ico": "image/x-icon",
 }
 
-# First-run defaults (formerly app/chores.json, retired once the browser
-# UI could edit chores). The database is the source of truth after the
-# first boot. Order matters: ids are assigned 1..n in exactly this order,
-# which is what the legacy state.json import maps "weekly:3"-style keys
-# onto, so keep entries stable.
-SEED_CHORES = {
-    "daily": [
-        {"area": "Kitchen", "text": "Wipe counters and stovetop after cooking"},
-        {"area": "Kitchen", "text": "Load / run / unload dishwasher"},
-        {"area": "Living areas", "text": "Quick tidy — pillows, blankets, surfaces"},
-        {"area": "Living areas", "text": "Wipe kitchen counters and tables"},
-        {"area": "Entryway", "text": "Put shoes and bags away"},
-        {"area": "Pool", "text": "Skim leaves and debris off the surface"},
-        {"area": "Pool", "text": "Tidy back patio"},
-        {"area": "General", "text": "Take out kitchen trash and recycling if full"},
-        {"area": "General", "text": "Wipe down bathroom sink(s)"},
-        {"area": "Pets", "text": "Feed cats / refresh water bowls"},
-    ],
-    "weekly": [
-        {"area": "Whole house", "text": "Vacuum all carpets and rugs"},
-        {"area": "Whole house", "text": "Mop hard floors (kitchen, bathrooms, entry)"},
-        {"area": "Whole house", "text": "Dust surfaces and shelves"},
-        {"area": "Bathrooms", "text": "Clean toilets, tubs, and showers"},
-        {"area": "Bathrooms", "text": "Replace towels"},
-        {"area": "Bedrooms", "text": "Change and wash bed linens"},
-        {"area": "Laundry", "text": "Wash, dry, fold, and put away all loads"},
-        {"area": "Kitchen", "text": "Clean out fridge — toss expired items"},
-        {"area": "Kitchen", "text": "Wipe down counters"},
-        {"area": "Upstairs", "text": "Vacuum stairs and landing"},
-        {"area": "Upstairs", "text": "Sweep/vacuum stairs"},
-        {"area": "Pool", "text": "Test and balance water chemistry"},
-        {"area": "Pool", "text": "Brush walls and vacuum pool floor"},
-        {"area": "Pool", "text": "Empty skimmer and pump baskets"},
-        {"area": "Lawn", "text": "Mow the lawn"},
-        {"area": "Lawn", "text": "Edge walkways and beds"},
-        {"area": "General", "text": "Wipe down light switches and door handles"},
-        {"area": "General", "text": "Water indoor plants"},
-        {"area": "General", "text": "Water outdoor plants"},
-        {"area": "Pets", "text": "Scoop out cat litter"},
-    ],
-    "monthly": [
-        {"area": "Kitchen", "text": "Clean oven and microwave interior"},
-        {"area": "Kitchen", "text": "Descale coffee maker / espresso machine"},
-        {"area": "Kitchen", "text": "Wipe inside of fridge"},
-        {"area": "Whole house", "text": "Wash windows (interior)"},
-        {"area": "Whole house", "text": "Dust ceiling fans and light fixtures"},
-        {"area": "Whole house", "text": "Vacuum under furniture and cushions"},
-        {"area": "Bathrooms", "text": "Scrub grout and deep-clean shower doors"},
-        {"area": "Bedrooms", "text": "Rotate/flip mattresses if applicable"},
-        {"area": "Laundry room", "text": "Clean washer drum and dryer lint trap housing"},
-        {"area": "Upstairs", "text": "Check and vacuum vents/air returns"},
-        {"area": "Pool", "text": "Deep-clean filter (backwash or rinse cartridge)"},
-        {"area": "Pool", "text": "Inspect pool cover, ladder, and safety fencing"},
-        {"area": "Lawn", "text": "Fertilize / treat lawn per season"},
-        {"area": "Lawn", "text": "Trim hedges and shrubs"},
-        {"area": "Garage/storage", "text": "Sweep garage and tidy storage areas"},
-        {"area": "General", "text": "Test smoke and CO detectors"},
-        {"area": "General", "text": "Vacuum refrigerator coils"},
-    ],
-    "yearly": [
-        {"area": "Whole house", "text": "Wash windows (exterior) and screens"},
-        {"area": "Whole house", "text": "Deep-clean carpets professionally or by machine"},
-        {"area": "Whole house", "text": "Repaint scuffed walls / touch up trim"},
-        {"area": "Roof/gutters", "text": "Clean gutters and downspouts"},
-        {"area": "Roof/gutters", "text": "Inspect roof for damage"},
-        {"area": "HVAC", "text": "Service furnace and A/C units"},
-        {"area": "HVAC", "text": "Replace all air filters"},
-        {"area": "Safety", "text": "Replace smoke/CO detector batteries"},
-        {"area": "Safety", "text": "Check fire extinguishers' charge dates"},
-        {"area": "Pool", "text": "Full pool opening (spring) service"},
-        {"area": "Pool", "text": "Full pool closing / winterizing (fall)"},
-        {"area": "Pool", "text": "Inspect pump, heater, and filter equipment"},
-        {"area": "Lawn", "text": "Aerate and overseed lawn"},
-        {"area": "Lawn", "text": "Prune trees; inspect for storm damage"},
-        {"area": "Lawn", "text": "Service mower and outdoor equipment"},
-        {"area": "Exterior", "text": "Power-wash siding, deck, and driveway"},
-        {"area": "Exterior", "text": "Reseal deck or patio if needed"},
-        {"area": "Admin", "text": "Review home insurance and warranties"},
-        {"area": "Admin", "text": "Declutter and donate — closets, garage, attic"},
-    ],
-}
+
+def parse_day(value, name="date"):
+    """Parse 'YYYY-MM-DD' to a date. Raises ValueError when invalid."""
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a YYYY-MM-DD string")
+    try:
+        year, month, day = (int(part) for part in value.split("-"))
+        return date(year, month, day)
+    except (ValueError, TypeError):
+        raise ValueError(f"{name} must be a YYYY-MM-DD string") from None
 
 
-def period_start(cycle, today=None):
-    """First day of the cycle period containing `today`."""
-    today = today or date.today()
-    if cycle == "daily":
-        return today
-    if cycle == "weekly":
-        return today - timedelta(days=today.weekday())  # Monday
-    if cycle == "monthly":
-        return today.replace(day=1)
-    if cycle == "yearly":
-        return today.replace(month=1, day=1)
-    raise ValueError(f"unknown cycle: {cycle}")
+def month_length(year, month):
+    """Days in a month (stdlib-only, no calendar import needed)."""
+    if month == 12:
+        return (date(year + 1, 1, 1) - date(year, 12, 1)).days
+    return (date(year, month + 1, 1) - date(year, month, 1)).days
+
+
+def expand_month_days(raw, year, month):
+    """Resolve stored month_days to concrete days for a month.
+
+    Stored values are 1..31 plus -1 meaning last day. Day 31 clamps
+    to the month length (Feb 28/29), so "monthly on the 31st" still
+    fires every month rather than skipping short ones.
+    """
+    length = month_length(year, month)
+    out = set()
+    for day in raw:
+        if day == -1:
+            out.add(length)
+        elif 1 <= day <= 31:
+            out.add(min(day, length))
+    return out
+
+
+def load_rule(row):
+    """Build a recurrence rule dict from a chores DB row."""
+    try:
+        weekdays = json.loads(row["weekdays"]) if row["weekdays"] else []
+    except (json.JSONDecodeError, TypeError):
+        weekdays = []
+    try:
+        month_days = json.loads(row["month_days"]) if row["month_days"] else []
+    except (json.JSONDecodeError, TypeError):
+        month_days = []
+    try:
+        anchor = parse_day(row["anchor"]) if row["anchor"] else None
+    except ValueError:
+        anchor = None
+    until = None
+    if row["until"]:
+        try:
+            until = parse_day(row["until"])
+        except ValueError:
+            until = None
+    return {
+        "freq": row["freq"],
+        "interval": row["interval"] or 1,
+        "weekdays": [w for w in weekdays if isinstance(w, int) and 0 <= w <= 6],
+        "month_days": [m for m in month_days if isinstance(m, int) and (-1 <= m <= 31 and m != 0)],
+        "anchor": anchor,
+        "until": until,
+    }
+
+
+def due_on(rule, day):
+    """True when a recurrence rule fires on `day` (pure date math).
+
+    Tier-1 frequencies: once / daily every N days / weekly every N weeks
+    on given weekdays / monthly every N months on given month-days
+    (with clamping + last-day token) / yearly every N years on the
+    anchor month/day (Feb 29 -> Feb 28 in non-leap years). Everything is
+    gated by anchor (nothing due before it starts) and until (optional
+    end date, inclusive).
+    """
+    freq = rule.get("freq")
+    anchor = rule.get("anchor")
+    until = rule.get("until")
+    interval = rule.get("interval") or 1
+    if anchor is None or day < anchor:
+        return False
+    if until is not None and day > until:
+        return False
+    if freq == "once":
+        return day == anchor
+    if freq == "daily":
+        return (day - anchor).days % max(1, interval) == 0
+    if freq == "weekly":
+        weekdays = rule.get("weekdays") or [anchor.weekday()]
+        if day.weekday() not in weekdays:
+            return False
+        anchor_monday = anchor - timedelta(days=anchor.weekday())
+        day_monday = day - timedelta(days=day.weekday())
+        weeks = (day_monday - anchor_monday).days // 7
+        return weeks % max(1, interval) == 0
+    if freq == "monthly":
+        month_days = rule.get("month_days") or [anchor.day]
+        if day.day not in expand_month_days(month_days, day.year, day.month):
+            return False
+        months = (day.year - anchor.year) * 12 + (day.month - anchor.month)
+        return months % max(1, interval) == 0
+    if freq == "yearly":
+        years = day.year - anchor.year
+        if years % max(1, interval) != 0:
+            return False
+        if anchor.month == 2 and anchor.day == 29:
+            want = 29 if (day.year % 4 == 0 and (day.year % 100 != 0 or day.year % 400 == 0)) else 28
+            return day.month == 2 and day.day == want
+        return day.month == anchor.month and day.day == anchor.day
+    return False
+
+
+def next_due(rule, start):
+    """First occurrence on or after `start`, or None when nothing is upcoming.
+
+    Bounded scan: daily is computed directly, weekly steps days for one
+    interval + a week, monthly steps months for one interval + a month, and
+    yearly steps years for one interval + a year. A window of one full
+    interval always contains a firing, so the extra step only guards the
+    anchor/selector alignment.
+    """
+    freq = rule.get("freq")
+    anchor = rule.get("anchor")
+    until = rule.get("until")
+    if anchor is None:
+        return None
+    if freq == "once":
+        return anchor if anchor >= start else None
+    if until is not None and start > until:
+        return None
+    interval = max(1, rule.get("interval") or 1)
+    day = max(start, anchor)
+    if freq == "daily":
+        remainder = (day - anchor).days % interval
+        if remainder:
+            day += timedelta(days=interval - remainder)
+        return day if until is None or day <= until else None
+    if freq == "weekly":
+        horizon = day + timedelta(days=interval * 7 + 7)
+        while day <= horizon and (until is None or day <= until):
+            if due_on(rule, day):
+                return day
+            day += timedelta(days=1)
+        return None
+    if freq == "monthly":
+        year, month = day.year, day.month
+        for _ in range(interval + 2):
+            for cand in sorted(
+                expand_month_days(rule.get("month_days") or [anchor.day],
+                                  year, month)
+            ):
+                try:
+                    candidate = date(year, month, cand)
+                except ValueError:
+                    continue
+                if candidate < day:
+                    continue
+                if until is not None and candidate > until:
+                    continue
+                if due_on(rule, candidate):
+                    return candidate
+            month += 1
+            if month > 12:
+                month, year = 1, year + 1
+        return None
+    if freq == "yearly":
+        for step in range(interval + 2):
+            year = day.year + step
+            if anchor.month == 2 and anchor.day == 29:
+                cand = 29 if (year % 4 == 0 and
+                              (year % 100 != 0 or year % 400 == 0)) else 28
+            else:
+                cand = anchor.day
+            try:
+                candidate = date(year, anchor.month, cand)
+            except ValueError:
+                continue
+            if candidate < day:
+                continue
+            if until is not None and candidate > until:
+                continue
+            if due_on(rule, candidate):
+                return candidate
+        return None
+    return None
 
 
 def connect():
@@ -171,17 +277,22 @@ def create_schema(conn):
         """
         CREATE TABLE IF NOT EXISTS chores (
             id         INTEGER PRIMARY KEY,
-            cycle      TEXT    NOT NULL
-                       CHECK (cycle IN ('daily','weekly','monthly','yearly')),
             area       TEXT    NOT NULL,
             text       TEXT    NOT NULL,
             position   INTEGER NOT NULL,
+            freq       TEXT    NOT NULL DEFAULT 'weekly'
+                       CHECK (freq IN ('once','daily','weekly','monthly','yearly')),
+            interval   INTEGER NOT NULL DEFAULT 1,
+            weekdays   TEXT,            -- JSON [0..6] Mon=0, for weekly
+            month_days TEXT,            -- JSON [1..31, -1=last], for monthly
+            anchor     TEXT    NOT NULL DEFAULT '',  -- 'YYYY-MM-DD' first due
+            until      TEXT,            -- 'YYYY-MM-DD' optional end, NULL = forever
             since      TEXT,          -- 'YYYY-MM-DD' added-date; NULL = since forever
             retired_at TEXT           -- soft-delete, reserved for UI chore editing
         );
         CREATE TABLE IF NOT EXISTS completions (
             chore_id     INTEGER NOT NULL REFERENCES chores(id) ON DELETE CASCADE,
-            period_start TEXT    NOT NULL,
+            period_start TEXT    NOT NULL,   -- occurrence date 'YYYY-MM-DD'
             PRIMARY KEY (chore_id, period_start)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS meta (
@@ -193,21 +304,148 @@ def create_schema(conn):
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
-def seed_chores(conn):
-    """Load SEED_CHORES with deterministic ids, only when the table is empty."""
-    if conn.execute("SELECT COUNT(*) FROM chores").fetchone()[0]:
-        return
-    rows = []
-    for cycle in CYCLES:
-        for position, item in enumerate(SEED_CHORES.get(cycle, [])):
-            rows.append((cycle, item["area"], item["text"], position))
-    if not rows:
-        raise RuntimeError("SEED_CHORES contains no chores")
-    conn.executemany(
-        "INSERT INTO chores (id, cycle, area, text, position) VALUES (?, ?, ?, ?, ?)",
-        [(i + 1, *row) for i, row in enumerate(rows)],
+def migrate_v1_to_v2(conn):
+    """In-place v1 (cycle column) -> v2 (recurrence rule columns).
+
+    Rules default sensibly and anchors land on the current period start so
+    no overdue flood appears on first open after upgrade:
+    - daily: anchor today.
+    - weekly: anchor the Monday of this week, weekday = that Monday.
+    - monthly: 1st of this month, month_days = [1].
+    - yearly: Jan 1 this year.
+
+    Completion rows need no remapping: in v1 the current period's start
+    date equals the anchor chosen above (day / Monday / 1st / Jan 1), so
+    checkmarks made so far keep counting as done today. Older rows are
+    left untouched as history.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(chores)").fetchall()]
+    if "freq" in cols:
+        return  # already v2
+    today = date.today()
+    conn.executescript(
+        """
+        ALTER TABLE chores ADD COLUMN freq TEXT NOT NULL DEFAULT 'weekly'
+          CHECK (freq IN ('once','daily','weekly','monthly','yearly'));
+        ALTER TABLE chores ADD COLUMN interval INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE chores ADD COLUMN weekdays TEXT;
+        ALTER TABLE chores ADD COLUMN month_days TEXT;
+        ALTER TABLE chores ADD COLUMN anchor TEXT NOT NULL DEFAULT '';
+        ALTER TABLE chores ADD COLUMN until TEXT;
+        """
     )
-    print(f"seeded {len(rows)} chores from SEED_CHORES")
+    for row in conn.execute("SELECT id, cycle FROM chores").fetchall():
+        rule = default_rule_for_cycle(row["cycle"], today)
+        conn.execute(
+            "UPDATE chores SET freq=?, interval=?, weekdays=?, month_days=?,"
+            " anchor=? WHERE id=?",
+            (rule["freq"], rule["interval"], rule["weekdays"],
+             rule["month_days"], rule["anchor"], row["id"]),
+        )
+    # Drop the old cycle column if SQLite supports it (3.35+); harmless
+    # to keep it on older builds.
+    try:
+        conn.execute("ALTER TABLE chores DROP COLUMN cycle")
+    except sqlite3.Error:
+        pass
+    print("migrated database v1 (cycles) -> v2 (recurrence rules)")
+
+
+def default_rule_for_cycle(cycle, today):
+    """DB-ready recurrence rule for a legacy v1 cycle (v1 -> v2 migration).
+
+    Returns DB column values: weekdays/month_days as JSON strings or None,
+    anchor as 'YYYY-MM-DD'. Anchors land on the current period start so a
+    migrated install shows these chores due now and never overdue.
+    """
+    if cycle == "daily":
+        anchor = today
+        weekdays = month_days = None
+        freq = "daily"
+    elif cycle == "weekly":
+        anchor = today - timedelta(days=today.weekday())  # Monday
+        weekdays = json.dumps([anchor.weekday()])
+        month_days = None
+        freq = "weekly"
+    elif cycle == "monthly":
+        anchor = today.replace(day=1)
+        weekdays = None
+        month_days = json.dumps([1])
+        freq = "monthly"
+    else:  # yearly
+        anchor = today.replace(month=1, day=1)
+        weekdays = month_days = None
+        freq = "yearly"
+    return {"freq": freq, "interval": 1, "weekdays": weekdays,
+            "month_days": month_days, "anchor": anchor.isoformat(),
+            "until": None}
+
+
+def normalize_rule(data):
+    """Validate a recurrence rule from the API/seed. Returns normalized dict.
+
+    Raises ValueError on bad input. Normalized form: freq, interval int,
+    weekdays/month_days as sorted JSON strings (or None), anchor/until as
+    'YYYY-MM-DD' strings (until may be None).
+    """
+    if not isinstance(data, dict):
+        raise ValueError("recurrence rule must be an object")
+    freq = data.get("freq", "weekly")
+    if freq not in FREQS:
+        raise ValueError(f"freq must be one of {', '.join(FREQS)}")
+    try:
+        interval = int(data.get("interval", 1))
+    except (TypeError, ValueError):
+        raise ValueError("interval must be an integer 1..30")
+    if not 1 <= interval <= MAX_INTERVAL:
+        raise ValueError("interval must be an integer 1..30")
+    anchor_raw = data.get("anchor")
+    if anchor_raw is None:
+        anchor = date.today()
+    else:
+        anchor = parse_day(anchor_raw, name="anchor")
+    until = None
+    if data.get("until") not in (None, ""):
+        until = parse_day(data.get("until"), name="until")
+        if until < anchor:
+            raise ValueError("until must not be before anchor")
+    weekdays = None
+    if freq == "weekly":
+        raw = data.get("weekdays")
+        if raw is None:
+            raw = [anchor.weekday()]
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("weekdays must be a non-empty list of 0..6")
+        clean = set()
+        for item in raw:
+            if isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 6:
+                raise ValueError("weekdays must be a non-empty list of 0..6")
+            clean.add(item)
+        weekdays = json.dumps(sorted(clean))
+    month_days = None
+    if freq == "monthly":
+        raw = data.get("month_days")
+        if raw is None:
+            raw = [anchor.day]
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("month_days must be a non-empty list of 1..31 or -1")
+        clean = set()
+        for item in raw:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ValueError("month_days must be a non-empty list of 1..31 or -1")
+            if item == -1 or 1 <= item <= 31:
+                clean.add(item)
+            else:
+                raise ValueError("month_days must be a non-empty list of 1..31 or -1")
+        month_days = json.dumps(sorted(clean))
+    return {
+        "freq": freq,
+        "interval": interval,
+        "weekdays": weekdays,
+        "month_days": month_days,
+        "anchor": anchor.isoformat(),
+        "until": until.isoformat() if until else None,
+    }
 
 
 def import_legacy_state(conn):
@@ -228,18 +466,28 @@ def import_legacy_state(conn):
         return
 
     imported = skipped = 0
+    today = date.today()
+    # Legacy keys arrive in seed order: daily:0..9, weekly:0..19,
+    # monthly:0..16, yearly:0..18. Map positionally onto the chores'
+    # new recurrence rules so old checkmarks land on
+    # today's occurrence date instead of a stale cycle period.
+    order = [r["id"] for r in conn.execute(
+        "SELECT id FROM chores ORDER BY position").fetchall()]
+    legacy_counts = {"daily": 10, "weekly": 20, "monthly": 17, "yearly": 19}
     for key, value in state.items():
         cycle, sep, idx_text = key.partition(":")
         row = None
-        if sep and cycle in CYCLES:
+        if sep and cycle in LEGACY_CYCLES:
             try:
                 position = int(idx_text)
             except ValueError:
                 position = -1
-            row = conn.execute(
-                "SELECT id FROM chores WHERE cycle = ? AND position = ?",
-                (cycle, position),
-            ).fetchone()
+            offset = sum(legacy_counts[c] for c in LEGACY_CYCLES
+                         if LEGACY_CYCLES.index(c) < LEGACY_CYCLES.index(cycle))
+            if 0 <= position < legacy_counts.get(cycle, 0):
+                target = offset + position
+                if target < len(order):
+                    row = {"id": order[target]}
         if row is None:
             if value:
                 print(f"legacy import: skipping unmappable key {key!r}")
@@ -249,7 +497,7 @@ def import_legacy_state(conn):
             conn.execute(
                 "INSERT OR IGNORE INTO completions (chore_id, period_start)"
                 " VALUES (?, ?)",
-                (row["id"], period_start(cycle).isoformat()),
+                (row["id"], today.isoformat()),
             )
             imported += 1
     conn.execute(
@@ -268,94 +516,154 @@ def init_db():
                 f"database schema v{version} is newer than this server "
                 f"(v{SCHEMA_VERSION})"
             )
-        create_schema(conn)
-        seed_chores(conn)
+        if version == 0:
+            # Fresh database (or a pre-versioned v1): plain schema create.
+            create_schema(conn)
+        elif version == 1:
+            # v1 database in the wild: migrate in place, then mark v2.
+            migrate_v1_to_v2(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         import_legacy_state(conn)
 
 
-
-def build_state():
-    """Response for GET /api/state: periods, chores, plus legacy mirror keys."""
-    today = date.today()
-    periods = {cycle: period_start(cycle, today).isoformat() for cycle in CYCLES}
-    with closing(connect()) as conn:
-        rows = conn.execute(
-            """
-            SELECT ch.id, ch.cycle, ch.area, ch.text, ch.position,
-                   CASE WHEN comp.chore_id IS NULL THEN 0 ELSE 1 END AS done
-            FROM chores ch
-            LEFT JOIN completions comp
-              ON comp.chore_id = ch.id
-             AND comp.period_start = CASE ch.cycle
-                     WHEN 'daily'   THEN ?
-                     WHEN 'weekly'  THEN ?
-                     WHEN 'monthly' THEN ?
-                     WHEN 'yearly'  THEN ?
-                 END
-            WHERE ch.retired_at IS NULL
-            ORDER BY CASE ch.cycle
-                         WHEN 'daily' THEN 0 WHEN 'weekly' THEN 1
-                         WHEN 'monthly' THEN 2 ELSE 3
-                     END,
-                     ch.position
-            """,
-            tuple(periods[cycle] for cycle in CYCLES),
-        ).fetchall()
-    chores = [
-        {
+def load_chores(conn):
+    """All active chores as dicts with parsed recurrence rules."""
+    rows = conn.execute(
+        "SELECT id, area, text, position, freq, interval, weekdays,"
+        " month_days, anchor, until FROM chores"
+        " WHERE retired_at IS NULL ORDER BY position"
+    ).fetchall()
+    chores = []
+    for row in rows:
+        rule = load_rule(row)
+        upcoming = next_due(rule, date.today())
+        chores.append({
             "id": row["id"],
-            "cycle": row["cycle"],
             "area": row["area"],
             "text": row["text"],
             "position": row["position"],
-            "done": bool(row["done"]),
-        }
-        for row in rows
-    ]
-    payload = {"periods": periods, "chores": chores}
-    # Legacy mirror keys so old open tabs (still running the positional
-    # version of the page) keep rendering checkmarks until reloaded.
+            "freq": rule["freq"],
+            "interval": rule["interval"],
+            "weekdays": rule["weekdays"],
+            "month_days": rule["month_days"],
+            "anchor": rule["anchor"].isoformat() if rule["anchor"] else None,
+            "until": rule["until"].isoformat() if rule["until"] else None,
+            "next_due": upcoming.isoformat() if upcoming else None,
+            "_rule": rule,
+        })
+    return chores
+
+
+def build_calendar(start, end, today=None):
+    """Response for GET /api/calendar: chores + per-date occurrence flags.
+
+    `start`/`end` are dates (inclusive, at most CALENDAR_MAX_DAYS apart).
+    Each date maps to [{id, done, overdue}]; overdue is derived (due,
+    before today, no completion row) so it never spills into another
+    day's list -- it only tints the calendar cell.
+
+    `today` overrides the server's own date, so the household's local day
+    (which can differ near midnight, or from a UTC container) drives the
+    overdue boundary. Defaults to the server date when not supplied.
+    """
+    today = today or date.today()
+    with closing(connect()) as conn:
+        chores = load_chores(conn)
+        done_rows = conn.execute(
+            "SELECT chore_id, period_start FROM completions"
+            " WHERE period_start BETWEEN ? AND ?",
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+    done = {(r["chore_id"], r["period_start"]) for r in done_rows}
+    dates = {}
+    day = start
+    while day <= end:
+        key = day.isoformat()
+        entries = []
+        for chore in chores:
+            if not due_on(chore["_rule"], day):
+                continue
+            is_done = (chore["id"], key) in done
+            entries.append({
+                "id": chore["id"],
+                "done": is_done,
+                "overdue": (day < today and not is_done),
+            })
+        dates[key] = entries
+        day += timedelta(days=1)
+    payload_chores = []
     for chore in chores:
-        if chore["done"]:
-            payload[f"{chore['cycle']}:{chore['position']}"] = True
-    return payload
+        item = {k: v for k, v in chore.items() if not k.startswith("_")}
+        payload_chores.append(item)
+    return {"from": start.isoformat(), "to": end.isoformat(),
+            "today": today.isoformat(), "chores": payload_chores,
+            "dates": dates}
 
 
-def toggle_chore(chore_id, done):
-    """Check/unchecked one chore in its current period. False if unknown id."""
+def build_state():
+    """Deprecated shim for GET /api/state: today's calendar as old shape."""
+    today = date.today()
+    data = build_calendar(today, today)
+    key = today.isoformat()
+    done_ids = {e["id"] for e in data["dates"].get(key, []) if e["done"]}
+    chores = []
+    for chore in data["chores"]:
+        chores.append({
+            "id": chore["id"],
+            "area": chore["area"],
+            "text": chore["text"],
+            "position": chore["position"],
+            "freq": chore["freq"],
+            "interval": chore["interval"],
+            "weekdays": chore["weekdays"],
+            "month_days": chore["month_days"],
+            "anchor": chore["anchor"],
+            "until": chore["until"],
+            "done": chore["id"] in done_ids,
+        })
+    return {"periods": {"daily": key}, "chores": chores, "today": key}
+
+
+def toggle_chore(chore_id, done, day=None):
+    """Check/uncheck one chore on one occurrence date. False if unknown id.
+
+    A completion may only be *created* on a date the rule actually fires, so a
+    stray POST can't leave orphan rows behind for the future history view.
+    Clearing is always allowed (and idempotent), so an existing checkmark can
+    still be undone after the chore's schedule is changed.
+    """
+    target = day or date.today()
     with closing(connect()) as conn, conn:
         row = conn.execute(
-            "SELECT cycle FROM chores WHERE id = ? AND retired_at IS NULL",
+            "SELECT freq, interval, weekdays, month_days, anchor, until"
+            " FROM chores WHERE id = ? AND retired_at IS NULL",
             (chore_id,),
         ).fetchone()
         if row is None:
             return False
-        period = period_start(row["cycle"]).isoformat()
+        stamp = target.isoformat()
         if done:
+            already = conn.execute(
+                "SELECT 1 FROM completions WHERE chore_id = ? AND period_start = ?",
+                (chore_id, stamp),
+            ).fetchone()
+            if already is None and not due_on(load_rule(row), target):
+                raise ValueError("chore is not due on that date")
             conn.execute(
                 "INSERT OR IGNORE INTO completions (chore_id, period_start)"
                 " VALUES (?, ?)",
-                (chore_id, period),
+                (chore_id, stamp),
             )
         else:
             conn.execute(
                 "DELETE FROM completions WHERE chore_id = ? AND period_start = ?",
-                (chore_id, period),
+                (chore_id, stamp),
             )
     return True
 
 
 def reset_cycle(cycle):
-    """Clear one cycle's current-period rows. False for an unknown cycle."""
-    if cycle not in CYCLES:
-        return False
-    period = period_start(cycle).isoformat()
-    with closing(connect()) as conn, conn:
-        conn.execute(
-            "DELETE FROM completions WHERE period_start = ?"
-            " AND chore_id IN (SELECT id FROM chores WHERE cycle = ?)",
-            (period, cycle),
-        )
+    """Deprecated no-op shim: cycles no longer exist; always True."""
     return True
 
 
@@ -371,53 +679,70 @@ def clean_field(value, name, max_len):
     return cleaned
 
 
-def create_chore(cycle, area, text):
-    """Append a chore to a cycle. Returns the new id; ValueError if invalid."""
-    if cycle not in CYCLES:
-        raise ValueError("unknown cycle")
+def create_chore(area, text, rule=None):
+    """Append a chore with a recurrence rule. Returns the new id."""
     area = clean_field(area, "area", MAX_AREA_LEN)
     text = clean_field(text, "text", MAX_TEXT_LEN)
+    norm = normalize_rule(rule or {})
     with closing(connect()) as conn, conn:
         position = conn.execute(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM chores WHERE cycle = ?",
-            (cycle,),
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM chores",
         ).fetchone()[0]
         cur = conn.execute(
-            "INSERT INTO chores (cycle, area, text, position) VALUES (?, ?, ?, ?)",
-            (cycle, area, text, position),
+            "INSERT INTO chores (area, text, position, freq, interval,"
+            " weekdays, month_days, anchor, until)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (area, text, position, norm["freq"], norm["interval"],
+             norm["weekdays"], norm["month_days"], norm["anchor"],
+             norm["until"]),
         )
         return cur.lastrowid
 
 
 def update_chore(chore_id, fields):
-    """Apply area/text/cycle changes to one active chore.
+    """Apply area/text/recurrence changes to one active chore.
 
     False for an unknown (or retired) id; ValueError on invalid input.
+    Recurrence keys (freq, interval, weekdays, month_days, anchor, until)
+    are validated together so partial updates can't leave a broken rule.
     """
     updates = {}
     if "area" in fields:
         updates["area"] = clean_field(fields["area"], "area", MAX_AREA_LEN)
     if "text" in fields:
         updates["text"] = clean_field(fields["text"], "text", MAX_TEXT_LEN)
-    if "cycle" in fields:
-        if fields["cycle"] not in CYCLES:
-            raise ValueError("unknown cycle")
-        updates["cycle"] = fields["cycle"]
-    if not updates:
-        raise ValueError("nothing to update (need area, text, or cycle)")
+    rule_keys = ("freq", "interval", "weekdays", "month_days", "anchor",
+                 "until")
+    rule_update = {k: fields[k] for k in rule_keys if k in fields}
+    if not updates and not rule_update:
+        raise ValueError("nothing to update (need area, text, or schedule)")
     with closing(connect()) as conn, conn:
         row = conn.execute(
-            "SELECT cycle FROM chores WHERE id = ? AND retired_at IS NULL",
+            "SELECT freq, interval, weekdays, month_days, anchor, until"
+            " FROM chores WHERE id = ? AND retired_at IS NULL",
             (chore_id,),
         ).fetchone()
         if row is None:
             return False
-        if updates.get("cycle") not in (None, row["cycle"]):
-            # Moving cycles: land at the end of the target list.
-            updates["position"] = conn.execute(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM chores WHERE cycle = ?",
-                (updates["cycle"],),
-            ).fetchone()[0]
+        if rule_update:
+            current = {
+                "freq": row["freq"],
+                "interval": row["interval"],
+                "weekdays": json.loads(row["weekdays"]) if row["weekdays"] else None,
+                "month_days": json.loads(row["month_days"]) if row["month_days"] else None,
+                "anchor": row["anchor"],
+                "until": row["until"],
+            }
+            current.update(rule_update)
+            norm = normalize_rule(current)
+            updates.update({
+                "freq": norm["freq"],
+                "interval": norm["interval"],
+                "weekdays": norm["weekdays"],
+                "month_days": norm["month_days"],
+                "anchor": norm["anchor"],
+                "until": norm["until"],
+            })
         assignments = ", ".join(f"{column} = ?" for column in updates)
         conn.execute(
             f"UPDATE chores SET {assignments} WHERE id = ?",
@@ -426,14 +751,13 @@ def update_chore(chore_id, fields):
     return True
 
 
-def reorder_chores(cycle, ids):
-    """Rewrite one cycle's positions from an exact, current id list.
+def reorder_chores(ids):
+    """Rewrite the global position order from an exact, current id list.
 
-    A stale list (another device edited first) raises ValueError instead of
-    scrambling the order.
+    Positions are global across all non-retired chores (one list, grouped
+    for display by area on the client). A stale list (another device
+    edited first) raises ValueError instead of scrambling the order.
     """
-    if cycle not in CYCLES:
-        raise ValueError("unknown cycle")
     if not isinstance(ids, list) or not ids:
         raise ValueError("ids must be a non-empty list")
     try:
@@ -446,13 +770,12 @@ def reorder_chores(cycle, ids):
         current = [
             r[0]
             for r in conn.execute(
-                "SELECT id FROM chores WHERE cycle = ? AND retired_at IS NULL"
-                " ORDER BY position",
-                (cycle,),
+                "SELECT id FROM chores WHERE retired_at IS NULL"
+                " ORDER BY position"
             )
         ]
         if sorted(ordered) != sorted(current):
-            raise ValueError("ids do not match this cycle's chores")
+            raise ValueError("ids do not match the active chores")
         conn.executemany(
             "UPDATE chores SET position = ? WHERE id = ?",
             list(enumerate(ordered)),
@@ -471,34 +794,49 @@ def retire_chore(chore_id):
 
 
 def apply_flat_state(flat):
-    """Deprecated POST /api/state: translate an old positional dict to rows."""
+    """Deprecated POST /api/state: translate an old positional dict to rows.
+
+    Keys like 'daily:3' map onto chore ids by position; values
+    toggle today's occurrence (v1 could only ever represent 'this period').
+    """
     applied = 0
+    today = date.today().isoformat()
+    legacy_counts = {"daily": 10, "weekly": 20, "monthly": 17, "yearly": 19}
     with closing(connect()) as conn, conn:
+        order = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM chores ORDER BY position"
+            ).fetchall()
+        ]
         for key, value in flat.items():
             cycle, sep, idx_text = key.partition(":")
-            if not sep or cycle not in CYCLES:
+            if not sep or cycle not in LEGACY_CYCLES:
                 continue  # not a positional key (e.g. 'periods' echoed back)
             try:
                 position = int(idx_text)
             except ValueError:
                 continue
-            row = conn.execute(
-                "SELECT id FROM chores WHERE cycle = ? AND position = ?",
-                (cycle, position),
-            ).fetchone()
-            if row is None:
+            offset = sum(
+                legacy_counts[c]
+                for c in LEGACY_CYCLES
+                if LEGACY_CYCLES.index(c) < LEGACY_CYCLES.index(cycle)
+            )
+            target = offset + position
+            if not (0 <= position < legacy_counts.get(cycle, 0)
+                    and target < len(order)):
                 continue
-            period = period_start(cycle).isoformat()
+            chore_id = order[target]
             if bool(value):
                 conn.execute(
                     "INSERT OR IGNORE INTO completions (chore_id, period_start)"
                     " VALUES (?, ?)",
-                    (row["id"], period),
+                    (chore_id, today),
                 )
             else:
                 conn.execute(
                     "DELETE FROM completions WHERE chore_id = ? AND period_start = ?",
-                    (row["id"], period),
+                    (chore_id, today),
                 )
             applied += 1
     return applied
@@ -529,6 +867,42 @@ class Handler(BaseHTTPRequestHandler):
             return None, "invalid JSON"
 
     def do_GET(self):
+        if self.path.startswith("/api/calendar"):
+            query = parse_qs(self.path.partition("?")[2])
+            try:
+                start = parse_day((query.get("from") or [None])[0] or
+                                  date.today().isoformat(), "from")
+                end = parse_day((query.get("to") or [None])[0] or
+                                (start + timedelta(days=6)).isoformat(), "to")
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            if end < start:
+                self._send_json({"error": "'to' must not precede 'from'"},
+                                status=400)
+                return
+            if (end - start).days + 1 > CALENDAR_MAX_DAYS:
+                self._send_json(
+                    {"error": f"range exceeds {CALENDAR_MAX_DAYS} days"},
+                    status=400,
+                )
+                return
+            today = None
+            if query.get("today"):
+                try:
+                    today = parse_day(query["today"][0], "today")
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=400)
+                    return
+            try:
+                payload = build_calendar(start, end, today)
+            except sqlite3.Error as exc:
+                print(f"GET /api/calendar failed: {exc}")
+                self._send_json({"error": "database error"}, status=500)
+                return
+            self._send_json(payload)
+            return
+
         if self.path == "/api/state":
             try:
                 payload = build_state()
@@ -589,14 +963,23 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/toggle":
                 if not isinstance(body, dict) or "id" not in body:
-                    self._send_json({"error": "expected {id, done}"}, status=400)
+                    self._send_json(
+                        {"error": "expected {id, done, date?}"}, status=400
+                    )
                     return
                 try:
                     chore_id = int(body["id"])
                 except (TypeError, ValueError):
                     self._send_json({"error": "id must be an integer"}, status=400)
                     return
-                if not toggle_chore(chore_id, bool(body.get("done", True))):
+                day = None
+                if body.get("date") is not None:
+                    try:
+                        day = parse_day(body["date"], "date")
+                    except ValueError as exc:
+                        self._send_json({"error": str(exc)}, status=400)
+                        return
+                if not toggle_chore(chore_id, bool(body.get("done", True)), day):
                     self._send_json({"error": "unknown chore"}, status=404)
                     return
                 self._send_json({"ok": True})
@@ -613,11 +996,14 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/chores":
                 if not isinstance(body, dict):
                     self._send_json(
-                        {"error": "expected {cycle, area, text}"}, status=400
+                        {"error": "expected {area, text, ...schedule}"}, status=400
                     )
                     return
                 chore_id = create_chore(
-                    body.get("cycle"), body.get("area"), body.get("text")
+                    body.get("area"), body.get("text"),
+                    {k: body[k] for k in
+                     ("freq", "interval", "weekdays", "month_days", "anchor",
+                      "until") if k in body},
                 )
                 self._send_json({"ok": True, "id": chore_id})
                 return
@@ -644,9 +1030,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if self.path == "/api/chores/reorder":
-                cycle = body.get("cycle") if isinstance(body, dict) else None
                 ids = body.get("ids") if isinstance(body, dict) else None
-                reorder_chores(cycle, ids)
+                reorder_chores(ids)
                 self._send_json({"ok": True})
                 return
 

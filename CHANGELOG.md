@@ -9,6 +9,117 @@ before `v0.1.0` aren't listed — that's when versioning started.
 
 ## [Unreleased]
 
+### Added
+
+- Calendar view replacing the four cycle tabs: switch between **Day**, **Week**,
+  and **Month**, with ‹/Today/› navigation. The month grid and week strip show a
+  dot per due chore (hollow = pending, filled = done, red = overdue) plus a red
+  badge counting that day's overdue chores; the selected day's chores are listed
+  in a side pane grouped by area, reusing the same checkbox rows as before.
+- Tier-1 recurrence rules per chore: `once` / `daily` / `weekly` / `monthly` /
+  `yearly`, each with an interval ("every 2 weeks"), weekday selectors for
+  weekly, month-day selectors (including "last day") for monthly, an anchor
+  first-due date, and an optional until end date. Occurrences are computed on
+  the fly with pure date math — no scheduler or pre-created instances.
+- Overdue highlighting is derived (due + before today + no completion), shown
+  in red on the calendar and flagged in the list, and never spills into a later
+  day's list.
+- `GET /api/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD` returning chores plus
+  per-date occurrence flags (`done` / `overdue`) for the range (capped at 62
+  days). `POST /api/toggle` now accepts an optional `date` to check a chore on
+  a specific day.
+- The chore editor's schedule section: a **Repeats** dropdown with an
+  "Every [N] [unit]" interval, weekday chips for weekly rules, a day-of-month
+  input (plus "last day") for monthly rules, and First due / Until date inputs.
+- Each chore in the `GET /api/calendar` payload now carries `next_due` — its
+  next occurrence on or after today, computed server-side with a new
+  `next_due()` helper (bounded scan reusing `due_on()`), or `null` when nothing
+  is upcoming. The front end never re-implements the date math.
+- An optional `today=YYYY-MM-DD` on `GET /api/calendar`, letting the caller set
+  the date `overdue` is derived against.
+- A stdlib `unittest` suite (`app/test_server.py`) covering the recurrence date
+  math, rule validation, the toggle guard, and the v1 → v2 migration, run with
+  `python3 -m unittest app.test_server`. It includes a brute-force cross-check
+  of `next_due()` against `due_on()` on 1,000 randomized rules.
+
+### Changed
+
+- The page is now **two surfaces** behind a **Calendar | Chores** switch.
+  Calendar stays the read-only "what's due" view (a row is just a checkbox),
+  and all add / reschedule / reorder / remove moved to the **Chores**
+  management list (every active chore grouped by area with its recurrence hint
+  and next-due date). Editing a single chore happens in one overlay — a
+  centered dialog on desktop, a bottom sheet under 700px — with progressive
+  disclosure: the interval, weekday chips, or day-of-month controls appear
+  under the Repeats preset. This fixes the old model, where a chore could only
+  be edited on a day it happened to be due. The header **Edit** toggle and the
+  inline per-row schedule controls are gone.
+- A failed toggle now rolls back and shows a message instead of leaving the
+  checkbox out of sync with the server until the next poll.
+- Muted text was darkened toward WCAG AA, `:focus-visible` outlines were added
+  to the custom buttons, calendar cells carry a summary `aria-label`, and the
+  progress bar is a proper `role="progressbar"`.
+- The calendar fetch is widened back to the 1st of the selected month so the
+  new overdue roll-up can see earlier-in-the-month days the current view does
+  not render.
+- Calendar polish: the week now starts on **Sunday** (month grid, week strip,
+  and the editor's weekday chips all follow), the month grid and week strip
+  render the same per-day content (done/total count, status stripe, overdue
+  badge), the selected day is marked with a dark ring so it stays obvious on an
+  overdue (red) day, and the day's progress bar moved into the day header beside
+  the "N / M done" label. Inter-area spacing was trimmed.
+- The per-chore dots in the day cells were replaced by a thin **status stripe**
+  (red = overdue, sage = pending, green = all done) now that the done/total
+  count makes the dots redundant; `renderDots()`/`fitDots()` and their `+N`
+  clamping are gone.
+
+- Database schema v2: the `cycle` column is replaced by recurrence rule columns
+  (`freq`, `interval`, `weekdays`, `month_days`, `anchor`, `until`). A v1
+  database migrates in place on boot (`PRAGMA user_version` 0/1/2 branch);
+  checkmarks are preserved because a legacy period's start date (day / Monday /
+  1st / Jan 1) is exactly the anchor the migration chooses, so no remapping is
+  needed and no overdue flood appears on first open.
+- `SEED_CHORES` keeps its legacy cycle grouping so seeded ids still line up
+  with the positional `state.json` import; each chore's rule is derived from
+  its old cycle and anchored to the current period on a fresh install.
+- The four "Reset" buttons are gone (cycles no longer exist);
+  `POST /api/reset` remains as a no-op shim for old open tabs.
+- Layout is a fixed app shell on desktop/tablet: the header and calendar stay
+  pinned, only the selected day's chore list scrolls, and both columns fill the
+  height instead of the page growing around a long list. The day header sticks
+  to the top of the list and each area header sticks just below it, so you keep
+  the date and the room you're in while a long list scrolls (each group carries
+  bottom padding so its header can always reach that offset instead of
+  detaching early and getting clipped). A **Hide done** button in the day header
+  trims finished chores and is remembered per browser, and calendar dot rows
+  clamp to their column so a busy day can't wrap and deform the grid. Under
+  860px it still stacks and scrolls the whole page.
+
+- The UI now sends its own local date to the calendar, so `overdue` follows the
+  household's wall clock instead of a UTC container's; `docker-compose.yml`
+  sets `TZ` to keep the server-side fallbacks in step.
+- Navigating the calendar paints its panes once (the chrome updates instantly
+  and the data follows) instead of rendering twice, and the Day/Week/Month and
+  Calendar/Chores switches now expose `aria-pressed`.
+
+### Fixed
+
+- `POST /api/toggle` no longer creates a completion on a date the rule doesn't
+  fire (400 instead), so a stray request can't leave orphan rows for the future
+  history view; clearing an existing checkmark is still always allowed.
+- With **Hide done** on, checking a chore off now removes its row immediately
+  instead of leaving it on screen until the next poll; if the save fails the row
+  reappears as the toggle rolls back.
+
+### Removed
+
+- The header **Edit** toggle and the inline per-row schedule controls
+  (replaced by the Chores surface and the editor overlay).
+- The Daily/Weekly/Monthly/Yearly tab strip and its panels.
+- The built-in starter chore list (`SEED_CHORES`) is no longer seeded on first
+  boot. New installations start clean and empty, so the built-in default chores
+  are gone and you add your own from the UI.
+
 
 ## [v0.2.3] - 2026-09-24
 
