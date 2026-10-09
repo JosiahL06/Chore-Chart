@@ -9,7 +9,7 @@ before `v0.1.0` aren't listed — that's when versioning started.
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-10-09
+## [v0.3.0] - 2026-10-09
 
 ### Added
 
