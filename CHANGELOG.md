@@ -9,6 +9,13 @@ before `v0.1.0` aren't listed — that's when versioning started.
 
 ## [Unreleased]
 
+### Changed
+
+- The `release-notes` workflow can now be triggered manually
+  (`workflow_dispatch`) with a `tag` input to re-release a specific version: it
+  checks out that tag's tree and refreshes the release's notes instead of
+  leaving them untouched.
+
 ## [v0.3.0] - 2026-10-09
 
 ### Added

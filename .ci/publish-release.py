@@ -9,6 +9,13 @@ Called by the release-notes workflow; the body includes the matching
     TOKEN     API token for the host running the job
     REGISTRY  registry prefix for the body's docker pull line, e.g. ghcr.io
 
+Optional environment:
+
+    RERELEASE set (non-empty, and not 0/false/no) to update the body of an
+              existing release in place instead of leaving it untouched --
+              the manual re-release path. Falls back to creating the release
+              when the tag was never released.
+
 Exits 0 when the release is published, when it already exists (re-runs are
 no-ops), or when CHANGELOG.md has no section for TAG (warning only); non-zero
 when the API fails.
@@ -95,26 +102,59 @@ body = (
     "`:latest` tracks the newest build; every build is also tagged with its git sha."
 )
 
+# RERELEASE (the manual dispatch path) refreshes an existing release's body; a
+# plain tag push only ever creates, so a re-run there stays a no-op.
+rerelease = os.environ.get("RERELEASE", "").strip().lower() not in ("", "0", "false", "no")
+
+headers = {
+    "Authorization": f"token {token}",
+    "Content-Type": "application/json",
+}
+
+
+def call(method, endpoint, payload=None):
+    """Call the release API; return (status, parsed-json-or-body-text)."""
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        method=method,
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            text = response.read().decode(errors="replace")
+            return response.status, json.loads(text) if text.strip() else None
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode(errors="replace")
+
+
+if rerelease:
+    # Update the notes of a release that already exists; fall through to
+    # create it when this version was never released before.
+    status, existing = call("GET", f"{url}/tags/{tag}")
+    if status == 200 and isinstance(existing, dict):
+        status, result = call(
+            "PATCH", f"{url}/{existing['id']}", {"name": tag, "body": body}
+        )
+        if 200 <= status < 300:
+            print(f"updated release {tag} (HTTP {status})")
+            sys.exit(0)
+        sys.exit(f"release API returned HTTP {status}: {result}")
+    if status != 404:
+        sys.exit(f"release API returned HTTP {status} looking up release {tag}: {existing}")
+
 print(f"POST {url}")
 # draft=True would leave it unpublished for review in the forge's web UI.
-request = urllib.request.Request(
-    url,
-    data=json.dumps({"tag_name": tag, "name": tag, "body": body}).encode(),
-    method="POST",
-    headers={
-        "Authorization": f"token {token}",
-        "Content-Type": "application/json",
-    },
-)
-try:
-    with urllib.request.urlopen(request) as response:
-        print(f"published release {tag} (HTTP {response.status})")
-except urllib.error.HTTPError as error:
-    payload = error.read().decode(errors="replace")
-    # A duplicate release comes back as 409 or as 422 with an
-    # "already_exists" validation error, depending on the host -- both
-    # mean "this tag was released before", so a re-run stays a no-op.
-    if error.code == 409 or (error.code == 422 and "already_exists" in payload):
-        print(f"release {tag} already exists -- left untouched")
-        sys.exit(0)
-    sys.exit(f"release API returned HTTP {error.code}: {payload}")
+status, result = call("POST", url, {"tag_name": tag, "name": tag, "body": body})
+if 200 <= status < 300:
+    print(f"published release {tag} (HTTP {status})")
+    sys.exit(0)
+# A duplicate release comes back as 409 or as 422 with an "already_exists"
+# validation error, depending on the host -- both mean "this tag was released
+# before", so a re-run stays a no-op.
+if isinstance(result, str) and (
+    status == 409 or (status == 422 and "already_exists" in result)
+):
+    print(f"release {tag} already exists -- left untouched")
+    sys.exit(0)
+sys.exit(f"release API returned HTTP {status}: {result}")

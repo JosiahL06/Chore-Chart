@@ -3,31 +3,57 @@ name: Publish Release Notes
 # A tag push (v0.2.1) publishes the matching CHANGELOG.md section as the
 # GitHub Release body via .ci/publish-release.py. Kept out of build.yaml so the
 # image build stays triggered by branch pushes only.
+#
+# The workflow can also be run by hand to (re)release a specific version: pass
+# its tag to the `tag` input (e.g. v0.3.0). The run checks out that tag's tree
+# -- so the CHANGELOG/VERSION published are the ones the version was cut with
+# -- and refreshes the existing release body instead of leaving it untouched.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to (re)release, e.g. v0.3.0 — empty uses the ref this ran on"
+        required: false
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   release-notes:
+    name: create / update release
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # create the release
+      contents: write   # create/update the release (GitHub gates releases on `contents`)
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Detect the version tag
+      - name: Resolve the version tag
         id: tag
         env:
+          INPUT_TAG: ${{ inputs.tag }}
           REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          TAG="${REF_NAME:-}"
-          case "$TAG" in
-            refs/tags/*) TAG="${TAG#refs/tags/}" ;;   # some runners return the full ref
-            refs/heads/*) TAG="" ;;
-          esac
+          # A manual dispatch may name the tag explicitly; otherwise fall back
+          # to the ref the run was triggered on (a v* tag push).
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG="${REF_NAME:-}"
+            case "$TAG" in
+              refs/tags/*) TAG="${TAG#refs/tags/}" ;;   # some runners return the full ref
+              refs/heads/*) TAG="" ;;
+            esac
+          fi
           case "$TAG" in v[0-9]*) ;; *) TAG="" ;; esac  # only vX.Y.Z releases
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           if [ -n "$TAG" ]; then
@@ -36,7 +62,15 @@ jobs:
             echo "not a version tag push (ref=$REF) -- nothing to publish"
           fi
 
+      - name: Checkout the tagged tree
+        uses: actions/checkout@v4
+        with:
+          # Publish CHANGELOG.md/VERSION exactly as they were at the tag, so a
+          # re-release of an older version can't pick up today's files.
+          ref: ${{ steps.tag.outputs.tag || github.ref }}
+
       - name: Check changelog has an entry for VERSION
+        if: ${{ steps.tag.outputs.tag != '' }}
         run: grep -q "^## \[$(cat VERSION)\]" CHANGELOG.md
 
       - name: Publish the CHANGELOG section as the release
@@ -46,4 +80,6 @@ jobs:
           REPO: ${{ github.repository }}
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           REGISTRY: ghcr.io
+          # A manual dispatch re-releases: refresh an existing release's body.
+          RERELEASE: ${{ inputs.tag != '' }}
         run: python3 .ci/publish-release.py
