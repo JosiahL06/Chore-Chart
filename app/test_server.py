@@ -278,6 +278,56 @@ class ChoreApiTests(DbTestCase):
         ahead = server.build_calendar(today, today, today + timedelta(days=1))
         self.assertTrue(ahead["dates"][today.isoformat()][0]["overdue"])
 
+    def test_create_and_update_chore_metadata(self):
+        cid = server.create_chore(
+            "Kitchen", "Wipe counters",
+            {"freq": "daily", "anchor": "2026-10-08"},
+            assignee="  Alex  ", high_priority=True,
+            tags=["  kitchen ", "Deep clean", "KITCHEN", ""],
+        )
+        with closing(server.connect()) as conn:
+            chore = next(c for c in server.load_chores(conn) if c["id"] == cid)
+        self.assertEqual(chore["assignee"], "Alex")
+        self.assertTrue(chore["high_priority"])
+        self.assertEqual(chore["tags"], ["kitchen", "Deep clean"])
+
+        self.assertTrue(server.update_chore(cid, {
+            "assignee": None, "high_priority": False, "tags": [],
+        }))
+        with closing(server.connect()) as conn:
+            chore = next(c for c in server.load_chores(conn) if c["id"] == cid)
+        self.assertIsNone(chore["assignee"])
+        self.assertFalse(chore["high_priority"])
+        self.assertEqual(chore["tags"], [])
+
+    def test_metadata_validation(self):
+        cid = server.create_chore("A", "a", {"freq": "daily",
+                                             "anchor": "2026-10-08"})
+        with self.assertRaises(ValueError):
+            server.update_chore(cid, {"assignee": 7})
+        with self.assertRaises(ValueError):
+            server.update_chore(cid, {"assignee": "x" * 81})
+        with self.assertRaises(ValueError):
+            server.update_chore(cid, {"high_priority": "yes"})
+        with self.assertRaises(ValueError):
+            server.update_chore(cid, {"tags": "a,b"})
+        with self.assertRaises(ValueError):
+            server.update_chore(cid, {"tags": ["x" * 31]})
+        with self.assertRaises(ValueError):
+            server.update_chore(cid, {"tags": [str(i) for i in range(13)]})
+
+    def test_calendar_occurrences_carry_high_priority(self):
+        today = date.today()
+        server.create_chore("Kitchen", "Normal",
+                            {"freq": "daily", "anchor": today.isoformat()})
+        server.create_chore("Kitchen", "Important",
+                            {"freq": "daily", "anchor": today.isoformat()},
+                            high_priority=True)
+        payload = server.build_calendar(today, today, today)
+        flags = {e["id"]: e["high_priority"]
+                 for e in payload["dates"][today.isoformat()]}
+        self.assertEqual(sorted(flags.values()), [False, True])
+
 
 V1_SCHEMA = """
 CREATE TABLE chores (
@@ -323,14 +373,36 @@ class MigrationTests(unittest.TestCase):
         server.DATA_DIR, server.DB_FILE, server.LEGACY_STATE = self._saved
         self._tmp.cleanup()
 
-    def test_schema_is_bumped_to_v2(self):
+    def test_schema_is_bumped_to_v4(self):
         with closing(server.connect()) as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             cols = [r[1] for r in conn.execute("PRAGMA table_info(chores)")]
-        self.assertEqual(version, 2)
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")]
+        self.assertEqual(version, 4)
         self.assertIn("freq", cols)
         self.assertIn("anchor", cols)
+        self.assertIn("assignee", cols)
+        self.assertIn("high_priority", cols)
+        self.assertIn("tags", cols)
+        self.assertIn("due_mode", cols)
+        self.assertIn("flex_unit", cols)
+        self.assertIn("flex_interval", cols)
+        self.assertIn("flex_anchor", cols)
+        self.assertIn("flex_completions", tables)
         # The old column is dropped on SQLite >= 3.35 and kept harmlessly below.
+
+    def test_new_metadata_defaults_are_empty(self):
+        with closing(server.connect()) as conn:
+            chores = {c["area"]: c for c in server.load_chores(conn)}
+        for chore in chores.values():
+            self.assertIsNone(chore["assignee"])
+            self.assertFalse(chore["high_priority"])
+            self.assertEqual(chore["tags"], [])
+            self.assertEqual(chore["due_mode"], "date")
+            self.assertIsNone(chore["flex_unit"])
+            self.assertEqual(chore["flex_interval"], 0)
+            self.assertIsNone(chore["flex_anchor"])
 
     def test_rules_are_derived_from_the_old_cycle(self):
         with closing(server.connect()) as conn:
@@ -353,6 +425,233 @@ class MigrationTests(unittest.TestCase):
                 "SELECT chore_id, period_start FROM completions").fetchall()
         self.assertEqual([(r["chore_id"], r["period_start"]) for r in rows],
                          [(2, self.monday.isoformat())])
+
+
+V2_SCHEMA = """
+CREATE TABLE chores (
+    id INTEGER PRIMARY KEY, area TEXT NOT NULL, text TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    freq TEXT NOT NULL DEFAULT 'weekly', interval INTEGER NOT NULL DEFAULT 1,
+    weekdays TEXT, month_days TEXT, anchor TEXT NOT NULL DEFAULT '',
+    until TEXT, since TEXT, retired_at TEXT
+);
+CREATE TABLE completions (
+    chore_id INTEGER NOT NULL, period_start TEXT NOT NULL,
+    PRIMARY KEY (chore_id, period_start)
+) WITHOUT ROWID;
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
+class MigrationV2Tests(unittest.TestCase):
+    """An existing v2 database gains the metadata columns, losing nothing."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._saved = (server.DATA_DIR, server.DB_FILE, server.LEGACY_STATE)
+        server.DATA_DIR = Path(self._tmp.name)
+        server.DB_FILE = server.DATA_DIR / "chore.db"
+        server.LEGACY_STATE = server.DATA_DIR / "state.json"
+        conn = sqlite3.connect(server.DB_FILE)
+        conn.executescript(V2_SCHEMA)
+        conn.execute(
+            "INSERT INTO chores (area, text, position, freq, interval,"
+            " anchor) VALUES ('Kitchen', 'Wipe counters', 0, 'daily', 1,"
+            " '2026-10-08')"
+        )
+        conn.execute(
+            "INSERT INTO completions (chore_id, period_start)"
+            " VALUES (1, '2026-10-08')"
+        )
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+        with redirect_stdout(io.StringIO()):
+            server.init_db()
+
+    def tearDown(self):
+        server.DATA_DIR, server.DB_FILE, server.LEGACY_STATE = self._saved
+        self._tmp.cleanup()
+
+    def test_schema_and_existing_row_are_preserved(self):
+        with closing(server.connect()) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            chore = server.load_chores(conn)[0]
+            completions = conn.execute(
+                "SELECT chore_id, period_start FROM completions").fetchall()
+        self.assertEqual(version, 4)
+        self.assertEqual(chore["text"], "Wipe counters")
+        self.assertIsNone(chore["assignee"])
+        self.assertFalse(chore["high_priority"])
+        self.assertEqual(chore["tags"], [])
+        self.assertEqual(chore["due_mode"], "date")
+        self.assertIsNone(chore["flex_unit"])
+        self.assertEqual(chore["flex_interval"], 0)
+        self.assertIsNone(chore["flex_anchor"])
+        self.assertEqual(
+            [(r["chore_id"], r["period_start"]) for r in completions],
+            [(1, "2026-10-08")],
+        )
+
+
+def flex_chore(chore_id=1, unit="month", interval=1, anchor=None,
+               until=None, high_priority=False):
+    return {
+        "id": chore_id,
+        "due_mode": "flex",
+        "flex_unit": unit,
+        "flex_interval": interval,
+        "flex_anchor": anchor,
+        "until": until,
+        "high_priority": high_priority,
+    }
+
+
+class FlexPeriodTests(unittest.TestCase):
+    def test_weeks_start_on_sunday_and_end_on_saturday(self):
+        thursday = d("2026-11-05")
+        start = server.period_start("week", thursday)
+        self.assertEqual(start, d("2026-11-01"))
+        self.assertEqual(server.period_end("week", start), d("2026-11-07"))
+        self.assertEqual(server.flex_period_key("week", start), "w:2026-11-01")
+
+    def test_months_and_years_have_natural_end_dates(self):
+        start = server.period_start("month", d("2026-02-17"))
+        self.assertEqual(start, d("2026-02-01"))
+        self.assertEqual(server.period_end("month", start), d("2026-02-28"))
+        year = server.period_start("year", d("2026-11-05"))
+        self.assertEqual(server.period_end("year", year), d("2026-12-31"))
+
+    def test_repeating_month_has_current_and_missed_occurrences(self):
+        chore = flex_chore(anchor=d("2026-10-01"))
+        occurrences = server.flex_occurrences(chore, d("2026-11-05"), set())
+        self.assertEqual(len(occurrences), 2)
+        missed, current = occurrences
+        self.assertEqual(missed["period_key"], "m:2026-10-01")
+        self.assertEqual(missed["due"], "2026-10-31")
+        self.assertTrue(missed["overdue"])
+        self.assertFalse(missed["current"])
+        self.assertEqual(current["period_key"], "m:2026-11-01")
+        self.assertEqual(current["due"], "2026-11-30")
+        self.assertFalse(current["overdue"])
+        self.assertTrue(current["current"])
+
+    def test_completed_missed_occurrence_is_omitted(self):
+        chore = flex_chore(anchor=d("2026-10-01"))
+        done = {(1, "m:2026-10-01")}
+        occurrences = server.flex_occurrences(chore, d("2026-11-05"), done)
+        self.assertEqual([o["period_key"] for o in occurrences],
+                         ["m:2026-11-01"])
+
+    def test_non_repeating_window_stays_until_done(self):
+        chore = flex_chore(interval=0, anchor=d("2026-10-01"))
+        occurrences = server.flex_occurrences(chore, d("2026-11-05"), set())
+        self.assertEqual(len(occurrences), 1)
+        self.assertTrue(occurrences[0]["overdue"])
+        done = {(1, "m:2026-10-01")}
+        occurrences = server.flex_occurrences(chore, d("2026-11-05"), done)
+        self.assertEqual(len(occurrences), 1)
+        self.assertTrue(occurrences[0]["done"])
+        self.assertFalse(occurrences[0]["overdue"])
+
+    def test_interval_skips_inactive_periods(self):
+        chore = flex_chore(unit="week", interval=2, anchor=d("2026-11-01"))
+        # The week of Nov 8 is inactive; only the missed Nov 1 occurrence
+        # is showing on Nov 10.
+        occurrences = server.flex_occurrences(chore, d("2026-11-10"), set())
+        self.assertEqual([o["period_key"] for o in occurrences],
+                         ["w:2026-11-01"])
+        self.assertTrue(occurrences[0]["overdue"])
+        self.assertEqual(server.next_flex_due(chore, d("2026-11-10")),
+                         d("2026-11-21"))
+
+    def test_anytime_is_undated_and_never_overdue(self):
+        chore = flex_chore(unit=None, interval=0, anchor=None)
+        occurrences = server.flex_occurrences(chore, d("2026-11-05"), set())
+        self.assertEqual(len(occurrences), 1)
+        self.assertEqual(occurrences[0]["period_key"], "once")
+        self.assertIsNone(occurrences[0]["due"])
+        self.assertFalse(occurrences[0]["overdue"])
+        self.assertIsNone(server.next_flex_due(chore, d("2026-11-05")))
+
+
+class FlexDbTests(DbTestCase):
+    def test_create_update_flex_timing(self):
+        cid = server.create_chore(
+            "Garage", "Clean out the car",
+            {"anchor": "2026-10-01"},
+            due_mode="flex", flex_unit="month", flex_interval=2,
+            flex_anchor="2026-11-01",
+        )
+        with closing(server.connect()) as conn:
+            chore = next(c for c in server.load_chores(conn) if c["id"] == cid)
+        self.assertEqual(chore["due_mode"], "flex")
+        self.assertEqual(chore["flex_unit"], "month")
+        self.assertEqual(chore["flex_interval"], 2)
+        self.assertEqual(chore["flex_anchor"], "2026-11-01")
+
+        self.assertTrue(server.update_chore(cid, {
+            "due_mode": "date", "freq": "weekly", "anchor": "2026-11-02",
+        }))
+        with closing(server.connect()) as conn:
+            chore = next(c for c in server.load_chores(conn) if c["id"] == cid)
+        self.assertEqual(chore["due_mode"], "date")
+        self.assertIsNone(chore["flex_unit"])
+        self.assertEqual(chore["flex_interval"], 0)
+        self.assertIsNone(chore["flex_anchor"])
+
+    def test_calendar_flexible_overdue_and_toggle(self):
+        today = d("2026-11-05")
+        cid = server.create_chore(
+            "Garage", "Clean out the car", {"anchor": "2026-10-01"},
+            due_mode="flex", flex_unit="month", flex_interval=0,
+            flex_anchor="2026-10-01",
+        )
+        data = server.build_calendar(today, today, today)
+        occurrence = next(o for o in data["flexible"] if o["id"] == cid)
+        self.assertTrue(occurrence["overdue"])
+        self.assertEqual(occurrence["due"], "2026-10-31")
+
+        self.assertTrue(server.toggle_chore(
+            cid, True, today, occurrence["period_key"]))
+        data = server.build_calendar(today, today, today)
+        occurrence = next(o for o in data["flexible"] if o["id"] == cid)
+        self.assertTrue(occurrence["done"])
+        self.assertFalse(occurrence["overdue"])
+
+    def test_toggle_rejects_an_inactive_period(self):
+        today = d("2026-11-05")
+        cid = server.create_chore(
+            "House", "Wash windows", {"anchor": "2026-11-01"},
+            due_mode="flex", flex_unit="week", flex_interval=1,
+            flex_anchor="2026-11-01",
+        )
+        with self.assertRaises(ValueError):
+            server.toggle_chore(cid, True, today, "m:2026-11-01")
+        with self.assertRaises(ValueError):
+            server.toggle_chore(cid, True, today, "w:2020-01-05")
+
+    def test_anytime_toggle_works_without_a_period_key(self):
+        today = d("2026-11-05")
+        cid = server.create_chore(
+            "House", "Donate old coats", {"anchor": "2026-11-01"},
+            due_mode="flex", flex_unit=None, flex_interval=0,
+        )
+        self.assertTrue(server.toggle_chore(cid, True, today))
+        data = server.build_calendar(today, today, today)
+        occurrence = next(o for o in data["flexible"] if o["id"] == cid)
+        self.assertEqual(occurrence["period_key"], "once")
+        self.assertTrue(occurrence["done"])
+
+    def test_flexible_fields_are_validated(self):
+        with self.assertRaises(ValueError):
+            server.create_chore("A", "a", {}, due_mode="sometimes")
+        with self.assertRaises(ValueError):
+            server.create_chore("A", "a", {}, due_mode="flex",
+                                flex_unit="fortnight")
+        with self.assertRaises(ValueError):
+            server.create_chore("A", "a", {}, due_mode="flex",
+                                flex_unit="month", flex_interval=31)
 
 
 if __name__ == "__main__":

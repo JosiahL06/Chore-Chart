@@ -7,12 +7,17 @@ Tiny single-file backend for the household chore chart.
   occurrence flags (done / overdue) for the requested range
 - GET  /api/state  -> deprecated shim (derived from today's calendar)
 - POST /api/toggle -> check/uncheck a single chore on a date
-  {"id": 17, "done": true, "date": "2026-10-08"} (date defaults to today)
+  {"id": 17, "done": true, "date": "2026-10-08"} (date defaults to today);
+  flexible chores also accept {"period_key": "m:2026-11-01"}
 - POST /api/reset  -> deprecated no-op shim (kept for old tabs)
 - POST /api/chores -> add a chore {"area", "text", "anchor", "freq"?,
-  "interval"?, "weekdays"?, "month_days"?, "until"?}
+  "interval"?, "weekdays"?, "month_days"?, "until"?, "assignee"?,
+  "high_priority"?, "tags"?, "due_mode"?, "flex_unit"?,
+  "flex_interval"?, "flex_anchor"?}
 - POST /api/chores/update  -> rename/reschedule {"id", "area"?, "text"?,
-  "anchor"?, "freq"?, "interval"?, "weekdays"?, "month_days"?, "until"?}
+  "anchor"?, "freq"?, "interval"?, "weekdays"?, "month_days"?, "until"?,
+  "assignee"?, "high_priority"?, "tags"?, "due_mode"?, "flex_unit"?,
+  "flex_interval"?, "flex_anchor"?}
 - POST /api/chores/reorder -> set display order {"ids": [...]}
 - POST /api/chores/retire  -> soft-delete one chore {"id"} (history kept)
 - POST /api/state  -> deprecated compat shim (old flat positional dict)
@@ -36,6 +41,17 @@ tabs) with the recurrence rule columns; the v1 calendar is gone and the
 old tab UI has been replaced by the Day/Week/Month calendar view. A v1
 database is migrated in place on boot (rules default sensibly, anchors
 land on the current period so no overdue flood appears on first open).
+Schema v3 adds lightweight chore metadata: a free-text assignee, a
+high-priority flag (only high-priority overdue chores feed the UI's
+banner), and a JSON tag list used for organizing/filtering. All three
+default to "unset" for existing rows, so the v2 -> v3 migration is a
+pure additive column add.
+Schema v4 adds a second timing mode: flexible chores that are not tied
+to a specific day. They live in a week/month/year window (or Anytime),
+can repeat every N windows, and become overdue when the window's end
+date passes without a completion. Their completions live in a separate
+flex_completions table keyed by the window period, so dated occurrence
+logic stays untouched.
 A legacy /app/data/state.json (positional keys like "weekly:3") is
 imported once on first boot and renamed to state.json.imported.
 """
@@ -55,14 +71,22 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 
 DB_FILE = DATA_DIR / "chore.db"
 LEGACY_STATE = DATA_DIR / "state.json"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 FREQS = ("once", "daily", "weekly", "monthly", "yearly")
+FLEX_UNITS = ("week", "month", "year")
+DUE_MODES = ("date", "flex")
+# Keep the flexible shelf bounded even if a repeating chore goes untouched
+# for a long time; the most recent missed windows are the relevant ones.
+MAX_FLEX_LOOKBACK = 12
 # Legacy v1 cycle names, kept only for the v1 -> v2 migration and the
 # deprecated flat state.json import.
 LEGACY_CYCLES = ("daily", "weekly", "monthly", "yearly")
 MAX_AREA_LEN = 80
 MAX_TEXT_LEN = 200
 MAX_INTERVAL = 30
+MAX_ASSIGNEE_LEN = 80
+MAX_TAG_LEN = 30
+MAX_TAGS = 12
 CALENDAR_MAX_DAYS = 62
 
 # Content types for the static UI assets served out of HTML_DIR
@@ -92,6 +116,68 @@ def month_length(year, month):
     if month == 12:
         return (date(year + 1, 1, 1) - date(year, 12, 1)).days
     return (date(year, month + 1, 1) - date(year, month, 1)).days
+
+
+# ------------------------------------------------------- flexible periods
+# Flexible chores are not tied to a day. Their occurrence is a whole
+# week/month/year (or a single "Anytime" instance), with the period end
+# acting as the derived due date. Weeks start on Sunday to match the UI.
+
+def week_start(day):
+    """Sunday that starts the week containing `day`."""
+    return day - timedelta(days=(day.weekday() + 1) % 7)
+
+
+def period_start(unit, day):
+    """First day of the week/month/year containing `day`."""
+    if unit == "week":
+        return week_start(day)
+    if unit == "month":
+        return day.replace(day=1)
+    if unit == "year":
+        return day.replace(month=1, day=1)
+    return None
+
+
+def period_end(unit, start):
+    """Last day of the period beginning on `start`."""
+    if unit == "week":
+        return start + timedelta(days=6)
+    if unit == "month":
+        return start.replace(day=month_length(start.year, start.month))
+    if unit == "year":
+        return date(start.year, 12, 31)
+    return None
+
+
+def add_periods(unit, start, count):
+    """Move a period start by `count` whole periods."""
+    if unit == "week":
+        return start + timedelta(days=7 * count)
+    if unit == "month":
+        month_index = start.year * 12 + (start.month - 1) + count
+        return date(month_index // 12, month_index % 12 + 1, 1)
+    if unit == "year":
+        return date(start.year + count, 1, 1)
+    return None
+
+
+def period_index(unit, anchor, start):
+    """Whole periods between two period starts."""
+    if unit == "week":
+        return (start - anchor).days // 7
+    if unit == "month":
+        return (start.year - anchor.year) * 12 + (start.month - anchor.month)
+    if unit == "year":
+        return start.year - anchor.year
+    return 0
+
+
+def flex_period_key(unit, start):
+    """Stable completion key for a flexible occurrence."""
+    if unit is None:
+        return "once"
+    return f"{unit[0]}:{start.isoformat()}"
 
 
 def expand_month_days(raw, year, month):
@@ -139,6 +225,24 @@ def load_rule(row):
         "anchor": anchor,
         "until": until,
     }
+
+
+def load_tags(row):
+    """Parse a stored tags JSON column into a clean list of strings.
+
+    Bad/legacy data degrades to an empty list rather than failing the read.
+    """
+    try:
+        raw = json.loads(row["tags"]) if row["tags"] else []
+    except (json.JSONDecodeError, TypeError):
+        raw = []
+    if not isinstance(raw, list):
+        return []
+    tags = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            tags.append(item.strip())
+    return tags[:MAX_TAGS]
 
 
 def due_on(rule, day):
@@ -263,6 +367,161 @@ def next_due(rule, start):
     return None
 
 
+def load_flex(row):
+    """Read the flexible timing columns into a normalized dict."""
+    due_mode = row["due_mode"] if row["due_mode"] in DUE_MODES else "date"
+    unit = row["flex_unit"] if row["flex_unit"] in FLEX_UNITS else None
+    try:
+        interval = int(row["flex_interval"] or 0)
+    except (TypeError, ValueError):
+        interval = 0
+    interval = max(0, min(MAX_INTERVAL, interval))
+    if due_mode != "flex":
+        return {"due_mode": "date", "flex_unit": None, "flex_interval": 0,
+                "flex_anchor": None, "until": None}
+    if unit is None:
+        interval = 0
+    anchor = None
+    if row["flex_anchor"]:
+        try:
+            anchor = period_start(unit, parse_day(row["flex_anchor"]))
+        except ValueError:
+            anchor = None
+    if unit is not None and anchor is None:
+        anchor = period_start(unit, date.today())
+    until = None
+    if row["until"]:
+        try:
+            until = parse_day(row["until"])
+        except ValueError:
+            until = None
+    return {
+        "due_mode": due_mode,
+        "flex_unit": unit,
+        "flex_interval": interval,
+        "flex_anchor": anchor,
+        "until": until,
+    }
+
+
+def flex_occurrence(chore, start, today, done_keys, current):
+    """One flexible occurrence (a whole period, or a single Anytime item)."""
+    unit = chore["flex_unit"]
+    key = flex_period_key(unit, start)
+    due = period_end(unit, start) if unit is not None else None
+    is_done = (chore["id"], key) in done_keys
+    return {
+        "id": chore["id"],
+        "period_key": key,
+        "period_start": start.isoformat() if start else None,
+        "due": due.isoformat() if due else None,
+        "done": is_done,
+        "overdue": bool(due is not None and not is_done and due < today),
+        "current": current,
+        "high_priority": chore["high_priority"],
+    }
+
+
+def flex_occurrences(chore, today, done_keys):
+    """Current and still-missed flexible occurrences for a chore.
+
+    Repeating chores expose the current period (even when already done, so
+    the checkbox can show its state) plus recent missed periods. Completed
+    past periods are omitted. A non-repeating windowed chore exposes its one
+    period until done, and Anytime chores expose one undated instance.
+    """
+    if chore["due_mode"] != "flex":
+        return []
+    unit = chore["flex_unit"]
+    if unit is None:
+        return [flex_occurrence(chore, None, today, done_keys, True)]
+
+    anchor = chore.get("_flex_anchor", chore.get("flex_anchor"))
+    if isinstance(anchor, str):
+        anchor = parse_day(anchor)
+    anchor = anchor or period_start(unit, today)
+    interval = max(0, chore["flex_interval"] or 0)
+    until = chore.get("_flex_until", chore.get("until"))
+    if isinstance(until, str):
+        until = parse_day(until)
+    if until is not None and anchor > until:
+        return []
+
+    if interval == 0:
+        current_start = period_start(unit, today)
+        if anchor > current_start:
+            return []
+        occurrence = flex_occurrence(
+            chore, anchor, today, done_keys,
+            current=current_start == anchor,
+        )
+        return [occurrence]
+
+    current_start = period_start(unit, today)
+    if current_start < anchor:
+        return []
+    index = period_index(unit, anchor, current_start)
+    if index < 0:
+        return []
+    latest_active = (index // interval) * interval
+    out = []
+
+    if latest_active == index:
+        occurrence = flex_occurrence(
+            chore, add_periods(unit, anchor, index), today, done_keys,
+            current=True,
+        )
+        if until is None or occurrence["period_start"] <= until.isoformat():
+            out.append(occurrence)
+
+    scan = latest_active - interval if latest_active == index else latest_active
+    scanned = 0
+    while scan >= 0 and scanned < MAX_FLEX_LOOKBACK:
+        start = add_periods(unit, anchor, scan)
+        if until is not None and start > until:
+            break
+        occurrence = flex_occurrence(chore, start, today, done_keys, False)
+        if not occurrence["done"]:
+            out.append(occurrence)
+        scan -= interval
+        scanned += 1
+
+    out.sort(key=lambda item: (item["due"] or "", item["period_key"]))
+    return out
+
+
+def next_flex_due(chore, today):
+    """Due date of the current or next active flexible occurrence."""
+    unit = chore["flex_unit"]
+    if unit is None:
+        return None
+    anchor = chore.get("_flex_anchor", chore.get("flex_anchor"))
+    if isinstance(anchor, str):
+        anchor = parse_day(anchor)
+    anchor = anchor or period_start(unit, today)
+    interval = max(0, chore["flex_interval"] or 0)
+    until = chore.get("_flex_until", chore.get("until"))
+    if isinstance(until, str):
+        until = parse_day(until)
+    if interval == 0:
+        due = period_end(unit, anchor)
+    else:
+        current_start = period_start(unit, today)
+        if current_start < anchor:
+            due = period_end(unit, anchor)
+        else:
+            index = period_index(unit, anchor, current_start)
+            active = (index // interval) * interval
+            if active == index:
+                due = period_end(unit, current_start)
+            else:
+                due = period_end(unit, add_periods(unit, anchor,
+                                                    active + interval))
+    if until is not None and due > until:
+        return None
+    return due
+
+
 def connect():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_FILE, timeout=5)
@@ -288,12 +547,27 @@ def create_schema(conn):
             anchor     TEXT    NOT NULL DEFAULT '',  -- 'YYYY-MM-DD' first due
             until      TEXT,            -- 'YYYY-MM-DD' optional end, NULL = forever
             since      TEXT,          -- 'YYYY-MM-DD' added-date; NULL = since forever
+            assignee   TEXT,          -- free-text person name; NULL = unassigned
+            high_priority INTEGER NOT NULL DEFAULT 0
+                       CHECK (high_priority IN (0, 1)),
+            tags       TEXT,          -- JSON list of free-form tags; NULL = none
+            due_mode   TEXT    NOT NULL DEFAULT 'date'
+                       CHECK (due_mode IN ('date', 'flex')),
+            flex_unit  TEXT    CHECK (flex_unit IS NULL OR
+                       flex_unit IN ('week', 'month', 'year')),
+            flex_interval INTEGER NOT NULL DEFAULT 0,
+            flex_anchor TEXT,          -- first period start for flexible chores
             retired_at TEXT           -- soft-delete, reserved for UI chore editing
         );
         CREATE TABLE IF NOT EXISTS completions (
             chore_id     INTEGER NOT NULL REFERENCES chores(id) ON DELETE CASCADE,
             period_start TEXT    NOT NULL,   -- occurrence date 'YYYY-MM-DD'
             PRIMARY KEY (chore_id, period_start)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS flex_completions (
+            chore_id   INTEGER NOT NULL REFERENCES chores(id) ON DELETE CASCADE,
+            period_key TEXT    NOT NULL,  -- 'once' | 'w:...' | 'm:...' | 'y:...'
+            PRIMARY KEY (chore_id, period_key)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
@@ -349,6 +623,74 @@ def migrate_v1_to_v2(conn):
     except sqlite3.Error:
         pass
     print("migrated database v1 (cycles) -> v2 (recurrence rules)")
+
+
+def migrate_v2_to_v3(conn):
+    """In-place v2 -> v3: add the chore metadata columns.
+
+    Everything is additive with safe defaults, so existing chores simply
+    become unassigned, normal priority, and untagged. The `assignee` and
+    `tags` columns are nullable; the priority flag defaults to 0.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(chores)").fetchall()}
+    added = False
+    if "assignee" not in cols:
+        conn.execute("ALTER TABLE chores ADD COLUMN assignee TEXT")
+        added = True
+    if "high_priority" not in cols:
+        conn.execute(
+            "ALTER TABLE chores ADD COLUMN high_priority INTEGER NOT NULL"
+            " DEFAULT 0 CHECK (high_priority IN (0, 1))"
+        )
+        added = True
+    if "tags" not in cols:
+        conn.execute("ALTER TABLE chores ADD COLUMN tags TEXT")
+        added = True
+    if added:
+        print("migrated database v2 -> v3 (assignee, high priority, tags)")
+
+
+def migrate_v3_to_v4(conn):
+    """In-place v3 -> v4: flexible timing columns + flex completions table.
+
+    Existing chores default to due_mode='date', so their dated behaviour is
+    unchanged. Anytime/flexible chores start with no unit, zero interval,
+    and no anchor.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(chores)").fetchall()}
+    added = False
+    if "due_mode" not in cols:
+        conn.execute(
+            "ALTER TABLE chores ADD COLUMN due_mode TEXT NOT NULL DEFAULT 'date'"
+            " CHECK (due_mode IN ('date', 'flex'))"
+        )
+        added = True
+    if "flex_unit" not in cols:
+        conn.execute(
+            "ALTER TABLE chores ADD COLUMN flex_unit TEXT"
+            " CHECK (flex_unit IS NULL OR flex_unit IN ('week', 'month', 'year'))"
+        )
+        added = True
+    if "flex_interval" not in cols:
+        conn.execute(
+            "ALTER TABLE chores ADD COLUMN flex_interval INTEGER NOT NULL"
+            " DEFAULT 0"
+        )
+        added = True
+    if "flex_anchor" not in cols:
+        conn.execute("ALTER TABLE chores ADD COLUMN flex_anchor TEXT")
+        added = True
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flex_completions (
+            chore_id   INTEGER NOT NULL REFERENCES chores(id) ON DELETE CASCADE,
+            period_key TEXT    NOT NULL,
+            PRIMARY KEY (chore_id, period_key)
+        ) WITHOUT ROWID
+        """
+    )
+    if added:
+        print("migrated database v3 -> v4 (flexible chores)")
 
 
 def default_rule_for_cycle(cycle, today):
@@ -518,25 +860,43 @@ def init_db():
             )
         if version == 0:
             # Fresh database (or a pre-versioned v1): plain schema create.
+            # The migration helpers are idempotent and also patch up a
+            # pre-versioned v1 table that CREATE IF NOT EXISTS left alone.
             create_schema(conn)
-        elif version == 1:
-            # v1 database in the wild: migrate in place, then mark v2.
             migrate_v1_to_v2(conn)
+            migrate_v2_to_v3(conn)
+            migrate_v3_to_v4(conn)
+        else:
+            if version == 1:
+                # v1 database in the wild: migrate in place through v4.
+                migrate_v1_to_v2(conn)
+                version = 2
+            if version == 2:
+                migrate_v2_to_v3(conn)
+                version = 3
+            if version == 3:
+                migrate_v3_to_v4(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         import_legacy_state(conn)
 
 
 def load_chores(conn):
-    """All active chores as dicts with parsed recurrence rules."""
+    """All active chores as dicts with parsed recurrence/timing rules."""
     rows = conn.execute(
         "SELECT id, area, text, position, freq, interval, weekdays,"
-        " month_days, anchor, until FROM chores"
+        " month_days, anchor, until, assignee, high_priority, tags,"
+        " due_mode, flex_unit, flex_interval, flex_anchor FROM chores"
         " WHERE retired_at IS NULL ORDER BY position"
     ).fetchall()
     chores = []
+    today = date.today()
     for row in rows:
         rule = load_rule(row)
-        upcoming = next_due(rule, date.today())
+        timing = load_flex(row)
+        if timing["due_mode"] == "flex":
+            upcoming = next_flex_due(timing, today)
+        else:
+            upcoming = next_due(rule, today)
         chores.append({
             "id": row["id"],
             "area": row["area"],
@@ -548,8 +908,18 @@ def load_chores(conn):
             "month_days": rule["month_days"],
             "anchor": rule["anchor"].isoformat() if rule["anchor"] else None,
             "until": rule["until"].isoformat() if rule["until"] else None,
+            "assignee": row["assignee"] or None,
+            "high_priority": bool(row["high_priority"]),
+            "tags": load_tags(row),
+            "due_mode": timing["due_mode"],
+            "flex_unit": timing["flex_unit"],
+            "flex_interval": timing["flex_interval"],
+            "flex_anchor": (timing["flex_anchor"].isoformat()
+                            if timing["flex_anchor"] else None),
             "next_due": upcoming.isoformat() if upcoming else None,
             "_rule": rule,
+            "_flex_anchor": timing["flex_anchor"],
+            "_flex_until": timing["until"],
         })
     return chores
 
@@ -560,7 +930,10 @@ def build_calendar(start, end, today=None):
     `start`/`end` are dates (inclusive, at most CALENDAR_MAX_DAYS apart).
     Each date maps to [{id, done, overdue}]; overdue is derived (due,
     before today, no completion row) so it never spills into another
-    day's list -- it only tints the calendar cell.
+    day's list -- it only tints the calendar cell. Flexible chores are
+    returned separately in `flexible`, since they belong to a whole
+    week/month/year instead of a specific day; their period end is the
+    derived due date.
 
     `today` overrides the server's own date, so the household's local day
     (which can differ near midnight, or from a UTC container) drives the
@@ -574,6 +947,12 @@ def build_calendar(start, end, today=None):
             " WHERE period_start BETWEEN ? AND ?",
             (start.isoformat(), end.isoformat()),
         ).fetchall()
+        flex_done = {
+            (r["chore_id"], r["period_key"])
+            for r in conn.execute(
+                "SELECT chore_id, period_key FROM flex_completions"
+            ).fetchall()
+        }
     done = {(r["chore_id"], r["period_start"]) for r in done_rows}
     dates = {}
     day = start
@@ -581,6 +960,8 @@ def build_calendar(start, end, today=None):
         key = day.isoformat()
         entries = []
         for chore in chores:
+            if chore["due_mode"] != "date":
+                continue
             if not due_on(chore["_rule"], day):
                 continue
             is_done = (chore["id"], key) in done
@@ -588,16 +969,26 @@ def build_calendar(start, end, today=None):
                 "id": chore["id"],
                 "done": is_done,
                 "overdue": (day < today and not is_done),
+                "high_priority": chore["high_priority"],
             })
         dates[key] = entries
         day += timedelta(days=1)
+    flexible = []
+    for chore in chores:
+        if chore["due_mode"] == "flex":
+            flexible.extend(flex_occurrences(chore, today, flex_done))
+    flexible.sort(key=lambda item: (
+        not item["overdue"],
+        item["due"] or "9999-12-31",
+        item["period_key"],
+    ))
     payload_chores = []
     for chore in chores:
         item = {k: v for k, v in chore.items() if not k.startswith("_")}
         payload_chores.append(item)
     return {"from": start.isoformat(), "to": end.isoformat(),
             "today": today.isoformat(), "chores": payload_chores,
-            "dates": dates}
+            "dates": dates, "flexible": flexible}
 
 
 def build_state():
@@ -619,28 +1010,89 @@ def build_state():
             "month_days": chore["month_days"],
             "anchor": chore["anchor"],
             "until": chore["until"],
+            "assignee": chore["assignee"],
+            "high_priority": chore["high_priority"],
+            "tags": chore["tags"],
+            "due_mode": chore["due_mode"],
+            "flex_unit": chore["flex_unit"],
+            "flex_interval": chore["flex_interval"],
+            "flex_anchor": chore["flex_anchor"],
             "done": chore["id"] in done_ids,
         })
-    return {"periods": {"daily": key}, "chores": chores, "today": key}
+    return {"periods": {"daily": key}, "chores": chores, "today": key,
+            "flexible": data.get("flexible", [])}
 
 
-def toggle_chore(chore_id, done, day=None):
-    """Check/uncheck one chore on one occurrence date. False if unknown id.
+def toggle_chore(chore_id, done, day=None, period_key=None):
+    """Check/uncheck a dated occurrence or a flexible period. False if unknown.
 
-    A completion may only be *created* on a date the rule actually fires, so a
-    stray POST can't leave orphan rows behind for the future history view.
-    Clearing is always allowed (and idempotent), so an existing checkmark can
-    still be undone after the chore's schedule is changed.
+    Dated chores may only *create* a completion on a date the rule actually
+    fires, so a stray POST can't leave orphan rows behind for the future
+    history view. Flexible chores may only create a completion for a period
+    that is currently active (current or a recent missed period). Clearing is
+    always allowed and idempotent, so a checkmark can still be undone after a
+    schedule change.
     """
     target = day or date.today()
     with closing(connect()) as conn, conn:
         row = conn.execute(
-            "SELECT freq, interval, weekdays, month_days, anchor, until"
+            "SELECT id, freq, interval, weekdays, month_days, anchor, until,"
+            " due_mode, flex_unit, flex_interval, flex_anchor, high_priority"
             " FROM chores WHERE id = ? AND retired_at IS NULL",
             (chore_id,),
         ).fetchone()
         if row is None:
             return False
+
+        if row["due_mode"] == "flex":
+            timing = load_flex(row)
+            chore = {
+                "id": row["id"],
+                "high_priority": bool(row["high_priority"]),
+                "due_mode": "flex",
+                **timing,
+            }
+            done_keys = {
+                (r["chore_id"], r["period_key"])
+                for r in conn.execute(
+                    "SELECT chore_id, period_key FROM flex_completions"
+                    " WHERE chore_id = ?",
+                    (chore_id,),
+                ).fetchall()
+            }
+            if not period_key:
+                current = next(
+                    (o for o in flex_occurrences(chore, target, done_keys)
+                     if o["current"]),
+                    None,
+                )
+                if current is None:
+                    raise ValueError(
+                        "period_key is required for a flexible chore"
+                    )
+                period_key = current["period_key"]
+            if not isinstance(period_key, str):
+                raise ValueError("period_key must be a string")
+            if done:
+                allowed = {
+                    o["period_key"]
+                    for o in flex_occurrences(chore, target, done_keys)
+                }
+                if period_key not in allowed:
+                    raise ValueError("flexible occurrence is no longer active")
+                conn.execute(
+                    "INSERT OR IGNORE INTO flex_completions"
+                    " (chore_id, period_key) VALUES (?, ?)",
+                    (chore_id, period_key),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM flex_completions"
+                    " WHERE chore_id = ? AND period_key = ?",
+                    (chore_id, period_key),
+                )
+            return True
+
         stamp = target.isoformat()
         if done:
             already = conn.execute(
@@ -679,46 +1131,187 @@ def clean_field(value, name, max_len):
     return cleaned
 
 
-def create_chore(area, text, rule=None):
+def normalize_assignee(value):
+    """Trim an optional free-text assignee. None/blank -> None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("assignee must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > MAX_ASSIGNEE_LEN:
+        raise ValueError(f"assignee must be at most {MAX_ASSIGNEE_LEN} characters")
+    return cleaned
+
+
+def normalize_high_priority(value):
+    """Normalize the high-priority flag to SQLite's 0/1."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int) and value in (0, 1):
+        return value
+    raise ValueError("high_priority must be a boolean")
+
+
+def normalize_tags(value):
+    """Validate a tag list, returning a JSON string (or None when empty).
+
+    Tags are trimmed, de-duplicated case-insensitively (first spelling
+    wins), and capped in both length and count.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("tags must be a list of strings")
+    clean = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("tags must be a list of strings")
+        tag = item.strip()
+        if not tag:
+            continue
+        if len(tag) > MAX_TAG_LEN:
+            raise ValueError(f"tags must be at most {MAX_TAG_LEN} characters")
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(tag)
+    if len(clean) > MAX_TAGS:
+        raise ValueError(f"a chore can have at most {MAX_TAGS} tags")
+    return json.dumps(clean) if clean else None
+
+
+def normalize_due_mode(value):
+    """'date' or 'flex'; missing defaults to the existing dated mode."""
+    if value in (None, ""):
+        return "date"
+    if value not in DUE_MODES:
+        raise ValueError("due_mode must be 'date' or 'flex'")
+    return value
+
+
+def normalize_flex_unit(value):
+    """Week/month/year window, or None for Anytime."""
+    if value in (None, "", "anytime"):
+        return None
+    if value not in FLEX_UNITS:
+        raise ValueError("flex_unit must be week, month, year, or null")
+    return value
+
+
+def normalize_flex_interval(value):
+    """0 = doesn't repeat; 1..30 = every N windows."""
+    if value in (None, ""):
+        return 0
+    if isinstance(value, bool):
+        raise ValueError("flex_interval must be an integer 0..30")
+    try:
+        interval = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("flex_interval must be an integer 0..30") from None
+    if not 0 <= interval <= MAX_INTERVAL:
+        raise ValueError("flex_interval must be an integer 0..30")
+    return interval
+
+
+def normalize_timing(due_mode="date", flex_unit=None, flex_interval=0,
+                     flex_anchor=None):
+    """Normalize a chore's timing mode into DB-ready values."""
+    mode = normalize_due_mode(due_mode)
+    if mode == "date":
+        return {
+            "due_mode": "date",
+            "flex_unit": None,
+            "flex_interval": 0,
+            "flex_anchor": None,
+        }
+    unit = normalize_flex_unit(flex_unit)
+    interval = normalize_flex_interval(flex_interval)
+    if unit is None:
+        interval = 0
+        anchor = None
+    else:
+        if flex_anchor in (None, ""):
+            anchor = period_start(unit, date.today())
+        else:
+            anchor = period_start(unit, parse_day(flex_anchor, "flex_anchor"))
+    return {
+        "due_mode": "flex",
+        "flex_unit": unit,
+        "flex_interval": interval,
+        "flex_anchor": anchor.isoformat() if anchor else None,
+    }
+
+
+def create_chore(area, text, rule=None, assignee=None, high_priority=False,
+                 tags=None, due_mode="date", flex_unit=None,
+                 flex_interval=0, flex_anchor=None):
     """Append a chore with a recurrence rule. Returns the new id."""
     area = clean_field(area, "area", MAX_AREA_LEN)
     text = clean_field(text, "text", MAX_TEXT_LEN)
     norm = normalize_rule(rule or {})
+    assignee = normalize_assignee(assignee)
+    priority = normalize_high_priority(high_priority)
+    tags_json = normalize_tags(tags)
+    timing = normalize_timing(due_mode, flex_unit, flex_interval, flex_anchor)
     with closing(connect()) as conn, conn:
         position = conn.execute(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM chores",
         ).fetchone()[0]
         cur = conn.execute(
             "INSERT INTO chores (area, text, position, freq, interval,"
-            " weekdays, month_days, anchor, until)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " weekdays, month_days, anchor, until, assignee, high_priority,"
+            " tags, due_mode, flex_unit, flex_interval, flex_anchor)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (area, text, position, norm["freq"], norm["interval"],
              norm["weekdays"], norm["month_days"], norm["anchor"],
-             norm["until"]),
+             norm["until"], assignee, priority, tags_json, timing["due_mode"],
+             timing["flex_unit"], timing["flex_interval"],
+             timing["flex_anchor"]),
         )
         return cur.lastrowid
 
 
 def update_chore(chore_id, fields):
-    """Apply area/text/recurrence changes to one active chore.
+    """Apply area/text/recurrence/metadata changes to one active chore.
 
     False for an unknown (or retired) id; ValueError on invalid input.
     Recurrence keys (freq, interval, weekdays, month_days, anchor, until)
     are validated together so partial updates can't leave a broken rule.
+    Metadata keys (assignee, high_priority, tags) are optional and may be
+    cleared with null / false / []. Timing keys switch between dated and
+    flexible modes; switching to date clears the flexible fields.
     """
     updates = {}
     if "area" in fields:
         updates["area"] = clean_field(fields["area"], "area", MAX_AREA_LEN)
     if "text" in fields:
         updates["text"] = clean_field(fields["text"], "text", MAX_TEXT_LEN)
+    if "assignee" in fields:
+        updates["assignee"] = normalize_assignee(fields["assignee"])
+    if "high_priority" in fields:
+        updates["high_priority"] = normalize_high_priority(fields["high_priority"])
+    if "tags" in fields:
+        updates["tags"] = normalize_tags(fields["tags"])
     rule_keys = ("freq", "interval", "weekdays", "month_days", "anchor",
                  "until")
     rule_update = {k: fields[k] for k in rule_keys if k in fields}
-    if not updates and not rule_update:
-        raise ValueError("nothing to update (need area, text, or schedule)")
+    timing_keys = ("due_mode", "flex_unit", "flex_interval", "flex_anchor")
+    timing_update = {k: fields[k] for k in timing_keys if k in fields}
+    if not updates and not rule_update and not timing_update:
+        raise ValueError(
+            "nothing to update (need area, text, schedule, timing, assignee,"
+            " priority, or tags)"
+        )
     with closing(connect()) as conn, conn:
         row = conn.execute(
-            "SELECT freq, interval, weekdays, month_days, anchor, until"
+            "SELECT freq, interval, weekdays, month_days, anchor, until,"
+            " due_mode, flex_unit, flex_interval, flex_anchor"
             " FROM chores WHERE id = ? AND retired_at IS NULL",
             (chore_id,),
         ).fetchone()
@@ -743,6 +1336,18 @@ def update_chore(chore_id, fields):
                 "anchor": norm["anchor"],
                 "until": norm["until"],
             })
+        if timing_update:
+            due_mode = fields.get("due_mode", row["due_mode"])
+            flex_unit = fields.get("flex_unit", row["flex_unit"])
+            flex_interval = fields.get("flex_interval", row["flex_interval"])
+            flex_anchor = fields.get("flex_anchor", row["flex_anchor"])
+            if ("flex_unit" in fields and "flex_anchor" not in fields
+                    and fields["flex_unit"] != row["flex_unit"]):
+                flex_anchor = None  # new window: start it in the current period
+            timing = normalize_timing(
+                due_mode, flex_unit, flex_interval, flex_anchor
+            )
+            updates.update(timing)
         assignments = ", ".join(f"{column} = ?" for column in updates)
         conn.execute(
             f"UPDATE chores SET {assignments} WHERE id = ?",
@@ -964,7 +1569,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/toggle":
                 if not isinstance(body, dict) or "id" not in body:
                     self._send_json(
-                        {"error": "expected {id, done, date?}"}, status=400
+                        {"error": "expected {id, done, date?, period_key?}"},
+                        status=400,
                     )
                     return
                 try:
@@ -979,7 +1585,10 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError as exc:
                         self._send_json({"error": str(exc)}, status=400)
                         return
-                if not toggle_chore(chore_id, bool(body.get("done", True)), day):
+                if not toggle_chore(
+                    chore_id, bool(body.get("done", True)), day,
+                    body.get("period_key"),
+                ):
                     self._send_json({"error": "unknown chore"}, status=404)
                     return
                 self._send_json({"ok": True})
@@ -1004,6 +1613,13 @@ class Handler(BaseHTTPRequestHandler):
                     {k: body[k] for k in
                      ("freq", "interval", "weekdays", "month_days", "anchor",
                       "until") if k in body},
+                    assignee=body.get("assignee"),
+                    high_priority=body.get("high_priority", False),
+                    tags=body.get("tags"),
+                    due_mode=body.get("due_mode", "date"),
+                    flex_unit=body.get("flex_unit"),
+                    flex_interval=body.get("flex_interval", 0),
+                    flex_anchor=body.get("flex_anchor"),
                 )
                 self._send_json({"ok": True, "id": chore_id})
                 return

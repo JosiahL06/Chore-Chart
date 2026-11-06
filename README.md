@@ -11,8 +11,10 @@ It's a simple app meant to just work at home; there are no accounts, everyone in
 ## Key features
 
 - **Per-chore schedules that reset themselves** — give each chore its own rule (every day, every 2 weeks on Mon/Thu, the last day of the month, …) and occurrence dates roll forward on their own. No one has to remember to hit "reset."
+- **Flexible chores** — some chores aren't tied to a day. Put them in a **This week / This month / This year** window, or leave them **Anytime**, with an optional repeat. They live in a **Flexible** shelf above the calendar, become overdue when their window ends, and reset on the next period when they repeat.
 - **Grouped by area** — chores are organized by where they happen (Kitchen, Bathrooms, Pool, Lawn, Pets, …), so whoever's in a room can see what that room needs.
-- **Editable right in the browser** — the **Chores** screen adds, reschedules, reorders, and removes chores, and every chore opens in an editor, so its schedule can be changed on any day (due or not). New installations start empty and become your household's own.
+- **Assignees, priorities, and tags** — assign a chore to a person, flag the important ones as **high priority** (only those feed the overdue banner; every overdue chore still shows in red), and add free-form tags to group and filter the routine list.
+- **Editable right in the browser** — the **Chores** screen adds, reschedules, reorders, and removes chores, filters and sorts by assignee or tag, and every chore opens in an editor, so its schedule can be changed on any day (due or not). New installations start empty and become your household's own.
 - **Syncs across devices** — every open device sees the same chart, so nobody doubles up on a chore someone else already finished. Progress shows in a bar at the top: *7 / 10 done*.
 - **Keeps working if the server hiccups** — the last view is cached locally, so the chart still renders when the server is briefly unreachable.
 - **Lightweight and dependency-free** — plain Python standard library on the back end, vanilla HTML/CSS/JS on the front end. No packages to install, no build step.

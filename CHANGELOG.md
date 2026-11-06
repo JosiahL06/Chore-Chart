@@ -9,6 +9,35 @@ before `v0.1.0` aren't listed — that's when versioning started.
 
 ## [Unreleased]
 
+## [v0.4.0] - 2026-11-6
+
+### Added
+
+- **Assignees** — assign a chore to a person from the editor (free text, with
+  suggestions from people already in use), see the assignee on calendar and
+  management rows, and filter or sort the **Chores** view by assignee. No
+  accounts: assignees are labels, so "completed by" tracking is still separate.
+- **High priority** — a checkbox in the chore editor and a badge on the row.
+  The overdue banner now counts only high-priority overdue chores; every
+  overdue chore still shows overdue in the calendar view and day list.
+- **Tags** — free-form tags edited as chips in the chore editor and shown on
+  rows. The **Chores** view gained an assignee filter, a tag filter, and a sort
+  control (manual, tag, or assignee), persisted in `localStorage`.
+- **Flexible chores** — chores can now skip a specific due date and live in an
+  **Anytime / Week / Month / Year** window instead. They appear in a dedicated
+  **Flexible** shelf above the calendar, can repeat every N windows, and use the
+  window end as their derived due date: unfinished windows become overdue, and
+  repeating chores reset on the next period. The editor gained an **On a date /
+  Flexible** timing switch.
+- The chore editor's Area, Assigned to, and Tags inputs now use focus-triggered
+  autocomplete menus: existing values are recommended while the field is
+  active (filtered as you type, keyboard navigable), and the list stays out of
+  the way otherwise.
+- Schema v3 adds `assignee`, `high_priority`, and `tags` to `chores`; schema v4
+  adds flexible timing (`due_mode`, `flex_unit`, `flex_interval`,
+  `flex_anchor`) and the `flex_completions` table. Existing v1/v2/v3 databases
+  migrate additively on boot with no data loss.
+
 ### Changed
 
 - The `release-notes` workflow can now be triggered manually

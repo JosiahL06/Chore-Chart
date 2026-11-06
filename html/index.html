@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Calendar-based household chore chart — day, week, and month views of recurring chores with overdue highlighting, synced across devices.">
+<meta name="description" content="Calendar-based household chore chart — day, week, and month views of recurring chores with assignees, tags, high priorities, and overdue highlighting, synced across devices.">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#f6f3ea">
 <title>Household Chore Chart</title>
@@ -41,6 +41,14 @@
 
   <div class="overdue-banner" id="overdueBanner" hidden></div>
 
+  <section class="flex-strip" id="flexStrip" aria-label="Flexible chores" hidden>
+    <div class="flex-strip-head">
+      <span class="flex-strip-title">Flexible</span>
+      <span class="flex-strip-note">not tied to a day</span>
+    </div>
+    <div class="flex-items" id="flexItems"></div>
+  </section>
+
   <main class="layout">
     <section class="cal-pane" id="calPane" aria-label="Calendar"></section>
     <section class="list-pane" id="listPane" aria-label="Chores for the selected day"></section>
@@ -53,10 +61,29 @@
     <span class="surface-count" id="choreCount"></span>
     <button class="primary-btn" id="addBtn" type="button">+ Add chore</button>
   </div>
+  <div class="chore-toolbar" id="choreToolbar">
+    <label class="toolbar-field">Assigned
+      <select id="assigneeFilter">
+        <option value="">Everyone</option>
+      </select>
+    </label>
+    <label class="toolbar-field">Tag
+      <select id="tagFilter">
+        <option value="">All tags</option>
+      </select>
+    </label>
+    <label class="toolbar-field">Sort
+      <select id="sortSelect">
+        <option value="manual">Manual order</option>
+        <option value="tag">Tag</option>
+        <option value="assignee">Assignee</option>
+      </select>
+    </label>
+  </div>
   <div id="choreGroups"></div>
 </section>
 
-<div class="legend">Pick a day to check chores off, or switch to <strong>Chores</strong> to add, reschedule, reorder, or remove them.</div>
+<div class="legend">Check off dated chores or the <strong>Flexible</strong> shelf, or switch to <strong>Chores</strong> to add, reschedule, reorder, remove, or filter them by assignee and tag.</div>
 
 <div class="scrim" id="scrim" hidden></div>
 <div class="sheet" id="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
@@ -68,23 +95,78 @@
     <label class="field">Name
       <input id="f-name" type="text" maxlength="200" autocomplete="off">
     </label>
-    <label class="field">Area
-      <input id="f-area" type="text" maxlength="80" list="areaOptions" autocomplete="off" placeholder="e.g. Kitchen">
-    </label>
-    <datalist id="areaOptions"></datalist>
+    <div class="field">
+      <label class="field-label" for="f-area">Area</label>
+      <div class="combo">
+        <input id="f-area" type="text" maxlength="80" autocomplete="off" placeholder="e.g. Kitchen"
+               role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="areaSuggestions">
+        <div class="combo-menu" id="areaSuggestions" role="listbox" aria-label="Area suggestions" hidden></div>
+      </div>
+    </div>
 
-    <div class="divider-label">Schedule</div>
-    <label class="field">Repeats
-      <select id="f-freq">
-        <option value="once">Does not repeat</option>
-        <option value="daily">Daily</option>
-        <option value="weekly">Weekly</option>
-        <option value="monthly">Monthly</option>
-        <option value="yearly">Yearly</option>
-      </select>
+    <div class="field">
+      <label class="field-label" for="f-assignee">Assigned to</label>
+      <div class="combo">
+        <input id="f-assignee" type="text" maxlength="80" autocomplete="off" placeholder="Unassigned"
+               role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="assigneeSuggestions">
+        <div class="combo-menu" id="assigneeSuggestions" role="listbox" aria-label="People suggestions" hidden></div>
+      </div>
+    </div>
+
+    <div class="field">
+      <span class="field-label">Tags</span>
+      <div class="tag-editor">
+        <div class="tag-chips" id="tagChips"></div>
+        <div class="tag-input-row">
+          <div class="combo tag-combo">
+            <input id="f-tag" type="text" autocomplete="off" placeholder="Add a tag, then press Enter"
+                   role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="tagSuggestions">
+            <div class="combo-menu" id="tagSuggestions" role="listbox" aria-label="Tag suggestions" hidden></div>
+          </div>
+          <button class="chip add-tag-btn" id="addTagBtn" type="button">Add</button>
+        </div>
+      </div>
+      <span class="field-hint">Pick a recommended tag or type a new one &mdash; tags filter and sort the Chores view.</span>
+    </div>
+
+    <label class="priority-field">
+      <input id="f-priority" type="checkbox">
+      <span>
+        <strong>High priority</strong>
+        <span class="field-hint">Only high-priority overdue chores appear in the banner; other overdue chores still show in red.</span>
+      </span>
     </label>
 
-    <div id="custom"></div>
+    <div class="divider-label">Timing</div>
+    <div class="timing-switch" id="timingSwitch" role="group" aria-label="Timing">
+      <button class="timing-btn" data-timing="date" type="button" aria-pressed="false">On a date</button>
+      <button class="timing-btn" data-timing="flex" type="button" aria-pressed="false">Flexible</button>
+    </div>
+
+    <div id="dateTiming">
+      <label class="field">Repeats
+        <select id="f-freq">
+          <option value="once">Does not repeat</option>
+          <option value="daily">Daily</option>
+          <option value="weekly">Weekly</option>
+          <option value="monthly">Monthly</option>
+          <option value="yearly">Yearly</option>
+        </select>
+      </label>
+
+      <div id="custom"></div>
+    </div>
+
+    <div class="flex-editor" id="flexTiming" hidden>
+      <div class="field">
+        <span class="field-label">Window</span>
+        <div class="chips" id="flexWindowChips"></div>
+      </div>
+      <label class="field">Repeats
+        <select id="f-flex-repeat"></select>
+      </label>
+      <span class="field-hint" id="flexTimingHint"></span>
+    </div>
 
     <div class="editor-error" id="editorError" hidden></div>
   </div>

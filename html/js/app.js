@@ -8,9 +8,12 @@
  *
  * A chore payload is:
  *   { id, area, text, position, freq, interval, weekdays, month_days,
- *     anchor, until, next_due }
+ *     anchor, until, assignee, high_priority, tags, due_mode, flex_unit,
+ *     flex_interval, flex_anchor, next_due }
  * plus per-day occurrences:
- *   dates: { 'YYYY-MM-DD': [{ id, done, overdue }] }
+ *   dates: { 'YYYY-MM-DD': [{ id, done, overdue, high_priority }] }
+ * and flexible occurrences:
+ *   flexible: [{ id, period_key, period_start, due, done, overdue, current }]
  * Editing a single chore happens in one overlay (desktop dialog / mobile
  * bottom sheet) opened from either surface, so a chore is editable any day.
  */
@@ -29,6 +32,15 @@ const CACHE_KEY = 'chore-chart-calendar-v1';
 const HIDE_DONE_KEY = 'chore-chart-hide-done';
 const VIEW_KEY = 'chore-chart-view';
 const SURFACE_KEY = 'chore-chart-surface';
+const ASSIGNEE_FILTER_KEY = 'chore-chart-assignee-filter';
+const TAG_FILTER_KEY = 'chore-chart-tag-filter';
+const SORT_KEY = 'chore-chart-sort';
+const UNASSIGNED = '__unassigned__';
+const UNTAGGED = '__untagged__';
+const MAX_TAGS = 12;
+const MAX_TAG_LEN = 30;
+const MAX_FLEX_INTERVAL = 30;
+const FLEX_UNITS = ['week', 'month', 'year'];
 
 let surface = readPref(SURFACE_KEY, 'calendar');
 let view = readPref(VIEW_KEY, 'week');
@@ -36,7 +48,11 @@ let selected = todayISO();
 let today = todayISO();
 let chores = [];
 let dates = {};
+let flexible = [];
 let editorState = null; // live editor draft, or null when the overlay is closed
+let assigneeFilter = readPref(ASSIGNEE_FILTER_KEY, '');
+let tagFilter = readPref(TAG_FILTER_KEY, '');
+let choreSort = readPref(SORT_KEY, 'manual');
 
 function readPref(key, fallback) {
   try { return localStorage.getItem(key) || fallback; } catch (e) { return fallback; }
@@ -77,6 +93,71 @@ function endOfMonth(s) {
   const dt = parseISO(s); dt.setMonth(dt.getMonth() + 1, 0); return toISO(dt);
 }
 function daysInMonth(s) { return parseISO(endOfMonth(s)).getDate(); }
+
+/* -------- flexible periods (week starts Sunday, matching the calendar) ---- */
+
+function periodStartOf(unit, s) {
+  if (unit === 'week') return weekStartOf(s);
+  if (unit === 'month') return startOfMonth(s);
+  if (unit === 'year') return s.slice(0, 4) + '-01-01';
+  return null;
+}
+
+function periodEndOf(unit, s) {
+  const start = periodStartOf(unit, s);
+  if (unit === 'week') return addDays(start, 6);
+  if (unit === 'month') return endOfMonth(start);
+  if (unit === 'year') return start.slice(0, 4) + '-12-31';
+  return null;
+}
+
+function addPeriods(unit, s, n) {
+  if (unit === 'week') return addDays(s, 7 * n);
+  if (unit === 'month') {
+    const dt = parseISO(s);
+    dt.setDate(1);
+    dt.setMonth(dt.getMonth() + n);
+    return toISO(dt);
+  }
+  if (unit === 'year') return String(parseISO(s).getFullYear() + n) + '-01-01';
+  return s;
+}
+
+function periodIndex(unit, anchor, start) {
+  if (unit === 'week') return Math.round(daysBetween(anchor, start) / 7);
+  if (unit === 'month') {
+    return (parseISO(start).getFullYear() - parseISO(anchor).getFullYear()) * 12 +
+      (parseISO(start).getMonth() - parseISO(anchor).getMonth());
+  }
+  if (unit === 'year') {
+    return parseISO(start).getFullYear() - parseISO(anchor).getFullYear();
+  }
+  return 0;
+}
+
+/** Due date of the current or next flexible occurrence (editor hint). */
+function nextFlexDue(unit, interval, anchor, from) {
+  if (!unit) return null;
+  const start = anchor ? periodStartOf(unit, anchor) : periodStartOf(unit, from);
+  if (!interval) return periodEndOf(unit, start);
+  const current = periodStartOf(unit, from);
+  if (current < start) return periodEndOf(unit, start);
+  const index = periodIndex(unit, start, current);
+  const active = Math.floor(index / interval) * interval;
+  if (active === index) return periodEndOf(unit, current);
+  return periodEndOf(unit, addPeriods(unit, start, active + interval));
+}
+
+function flexRepeatText(unit, interval) {
+  if (!unit) return '';
+  if (!interval) return 'once';
+  return interval === 1 ? `every ${unit}` : `every ${interval} ${unit}s`;
+}
+
+function scopeLabel(unit) {
+  return unit === 'week' ? 'This week' : unit === 'month' ? 'This month' :
+    unit === 'year' ? 'This year' : 'Anytime';
+}
 
 /** Inclusive [from, to] the current view renders. */
 function rangeFor(sel, which) {
@@ -149,10 +230,22 @@ function ruleHint(c) {
   return s;
 }
 
+/** Recurrence/flexible hint used by the Chores list. */
+function scheduleHint(c) {
+  if (c.due_mode !== 'flex') return ruleHint(c);
+  if (!c.flex_unit) return 'anytime';
+  const repeat = flexRepeatText(c.flex_unit, c.flex_interval);
+  const overdue = flexible.some(o => o.id === c.id && o.overdue);
+  if (overdue) return repeat; // the Overdue column carries the due date
+  return c.next_due
+    ? `${repeat} · due ${formatDay(c.next_due, { month: 'short', day: 'numeric' })}`
+    : repeat;
+}
+
 /* ------------------------------------------------------------------ cache */
 
 function snapshot() {
-  return JSON.stringify({ surface, view, selected, today, chores, dates });
+  return JSON.stringify({ surface, view, selected, today, chores, dates, flexible });
 }
 function cacheState() {
   try { localStorage.setItem(CACHE_KEY, snapshot()); } catch (e) { /* ignore */ }
@@ -162,8 +255,9 @@ function restoreCache() {
     const raw = localStorage.getItem(CACHE_KEY);
     if (!raw) return false;
     const s = JSON.parse(raw);
-    if (Array.isArray(s.chores)) chores = s.chores;
+    if (Array.isArray(s.chores)) chores = s.chores.map(normalizeCachedChore);
     if (s.dates && typeof s.dates === 'object') dates = s.dates;
+    if (Array.isArray(s.flexible)) flexible = s.flexible;
     if (s.today) today = s.today;
     if (s.selected) selected = s.selected;
     return chores.length > 0;
@@ -184,8 +278,9 @@ async function loadCalendar() {
     );
     if (res.ok) {
       const data = await res.json();
-      chores = data.chores || [];
+      chores = (data.chores || []).map(normalizeCachedChore);
       dates = data.dates || {};
+      flexible = data.flexible || [];
       today = localToday;
       cacheState();
       return true;
@@ -218,6 +313,12 @@ function saveToggle(id, done, day) {
   return postChoreApi('/api/toggle', { id, done, date: day });
 }
 
+function saveFlexToggle(id, done, periodKey) {
+  return postChoreApi('/api/toggle', {
+    id, done, period_key: periodKey, date: todayISO(),
+  });
+}
+
 /* ------------------------------------------------------------ small utils */
 
 function el(tag, className, textContent) {
@@ -225,6 +326,46 @@ function el(tag, className, textContent) {
   if (className) node.className = className;
   if (textContent !== undefined) node.textContent = textContent;
   return node;
+}
+
+/** Tags are stored as a list, but an old cached payload may have none. */
+function choreTags(chore) {
+  return Array.isArray(chore.tags) ? chore.tags : [];
+}
+
+/** People already used as assignees, alphabetically. */
+function allAssignees() {
+  return [...new Set(chores.map(c => c.assignee).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+}
+
+/** Every tag in use, de-duplicated case-insensitively (first spelling wins). */
+function allTags() {
+  const seen = new Map();
+  chores.forEach(c => choreTags(c).forEach(tag => {
+    const key = tag.toLocaleLowerCase();
+    if (!seen.has(key)) seen.set(key, tag);
+  }));
+  return [...seen.values()]
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+}
+
+function tagKey(tag) { return tag.toLocaleLowerCase(); }
+
+function sameTag(a, b) { return tagKey(a) === tagKey(b); }
+
+/** Normalize a cached chore so metadata fields always have their shape. */
+function normalizeCachedChore(chore) {
+  return {
+    ...chore,
+    assignee: chore.assignee || null,
+    high_priority: !!chore.high_priority,
+    tags: choreTags(chore),
+    due_mode: chore.due_mode === 'flex' ? 'flex' : 'date',
+    flex_unit: FLEX_UNITS.includes(chore.flex_unit) ? chore.flex_unit : null,
+    flex_interval: Math.max(0, Number(chore.flex_interval) || 0),
+    flex_anchor: chore.flex_anchor || null,
+  };
 }
 
 /* -------------------------------------------------------- header controls */
@@ -300,6 +441,7 @@ function renderAll() {
   renderChrome();
   if (surface === 'chores') { renderChores(); return; }
   renderOverdue();
+  renderFlexible();
   renderCalendar();
   renderList(); // also refreshes the progress bar in its header
 }
@@ -311,6 +453,65 @@ function renderCalendar() {
   pane.appendChild(view === 'week' ? renderWeek() : renderMonth());
 }
 
+/** Flexible chores: a shelf above the dated grid, omitted when empty. */
+function renderFlexible() {
+  const strip = document.getElementById('flexStrip');
+  const wrap = document.getElementById('flexItems');
+  const byId = new Map(chores.map(c => [c.id, c]));
+  const items = flexible
+    .map(occ => ({ occ, chore: byId.get(occ.id) }))
+    .filter(item => item.chore)
+    .sort((a, b) => {
+      if (a.occ.overdue !== b.occ.overdue) return a.occ.overdue ? -1 : 1;
+      const ad = a.occ.due || '9999-12-31';
+      const bd = b.occ.due || '9999-12-31';
+      return ad.localeCompare(bd) || a.chore.text.localeCompare(b.chore.text);
+    });
+
+  wrap.innerHTML = '';
+  strip.hidden = !items.length;
+  if (!items.length) return;
+  items.forEach(({ occ, chore }) => wrap.appendChild(flexCard(chore, occ)));
+}
+
+function flexCard(chore, occ) {
+  const card = el('label', 'flex-item' +
+    (occ.done ? ' done' : '') + (occ.overdue ? ' overdue' : ''));
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = !!occ.done;
+  const period = occ.current
+    ? scopeLabel(chore.flex_unit)
+    : (occ.due ? `due ${formatDay(occ.due, { month: 'short', day: 'numeric' })}` : '');
+  cb.setAttribute('aria-label',
+    `${chore.text}${period ? ', ' + period : ''}${occ.overdue ? ', overdue' : ''}`);
+
+  const body = el('span', 'flex-item-body');
+  body.appendChild(el('span', 'flex-item-text', chore.text));
+  const meta = el('span', 'flex-meta');
+  if (occ.overdue) meta.appendChild(el('span', 'overdue-flag', 'overdue'));
+  if (occ.current) {
+    const scope = el('span', 'scope-pill' + (chore.flex_unit ? '' : ' anytime'),
+      scopeLabel(chore.flex_unit));
+    meta.appendChild(scope);
+  }
+  if (occ.due) {
+    meta.appendChild(el('span', 'flex-due',
+      `due ${formatDay(occ.due, { month: 'short', day: 'numeric' })}`));
+  }
+  if (chore.flex_unit) {
+    meta.appendChild(el('span', 'flex-repeat',
+      flexRepeatText(chore.flex_unit, chore.flex_interval)));
+  }
+  if (chore.assignee) meta.appendChild(el('span', 'flex-assignee', chore.assignee));
+  body.appendChild(meta);
+
+  card.appendChild(cb);
+  card.appendChild(body);
+  cb.addEventListener('change', () => setFlexDone(chore, occ, card, cb));
+  return card;
+}
+
 /**
  * The calendar and the day list are rendered independently, so a toggle made
  * from the list has to nudge the calendar too: its per-day tally, status stripe
@@ -319,6 +520,7 @@ function renderCalendar() {
 function refreshCalendarSide() {
   if (surface !== 'calendar') return;
   renderOverdue();
+  renderFlexible();
   renderCalendar();
 }
 
@@ -490,7 +692,7 @@ function renderList() {
   applyStickyOffsets();
 }
 
-/** A calendar row: checkbox + text + recurrence hint (+ overdue flag). */
+/** A calendar row: checkbox + text + recurrence hint (+ metadata flags). */
 function calendarRow(chore, occ) {
   const day = selected; // the date these rows were rendered for
   const row = el('div', 'task' + (occ.done ? ' done' : '') + (occ.overdue ? ' overdue' : ''));
@@ -502,7 +704,8 @@ function calendarRow(chore, occ) {
   const body = el('div', 'task-body');
   body.appendChild(el('div', 'task-text', chore.text));
   body.appendChild(el('div', 'task-when', ruleHint(chore)));
-  if (occ.overdue) body.appendChild(el('span', 'overdue-flag', 'overdue'));
+  const meta = choreMeta(chore, occ);
+  if (meta) body.appendChild(meta);
 
   row.appendChild(cb);
   row.appendChild(body);
@@ -514,6 +717,34 @@ function calendarRow(chore, occ) {
     }
   });
   return row;
+}
+
+/**
+ * Assignee / tags / priority / overdue badges. Returns null when a chore has
+ * no metadata, so plain rows stay uncluttered.
+ */
+function choreMeta(chore, occ) {
+  const tags = choreTags(chore);
+  const overdue = !!(occ && occ.overdue);
+  if (!chore.high_priority && !chore.assignee && !tags.length && !overdue) return null;
+  const meta = el('div', 'task-meta');
+  if (chore.high_priority) {
+    const flag = el('span', 'prio-flag', 'High priority');
+    flag.title = 'High priority';
+    meta.appendChild(flag);
+  }
+  if (chore.assignee) {
+    const person = el('span', 'assignee-pill', chore.assignee);
+    person.title = `Assigned to ${chore.assignee}`;
+    meta.appendChild(person);
+  }
+  tags.forEach(tag => {
+    const pill = el('span', 'tag-pill', '#' + tag);
+    pill.title = `Tag: ${tag}`;
+    meta.appendChild(pill);
+  });
+  if (overdue) meta.appendChild(el('span', 'overdue-flag', 'overdue'));
+  return meta;
 }
 
 /**
@@ -530,13 +761,23 @@ function applyStickyOffsets() {
 function renderChores() {
   const wrap = document.getElementById('choreGroups');
   wrap.innerHTML = '';
+  const toolbar = document.getElementById('choreToolbar');
+  toolbar.hidden = !chores.length;
+  syncChoreFilters();
+
+  const shown = chores.filter(matchesChoreFilters);
   const groups = new Map();
-  chores.forEach(c => {
+  shown.forEach(c => {
     if (!groups.has(c.area)) groups.set(c.area, []);
     groups.get(c.area).push(c);
   });
+
+  const areas = groups.size;
+  const filtering = !!(assigneeFilter || tagFilter);
   document.getElementById('choreCount').textContent = chores.length
-    ? `${chores.length} chore${chores.length === 1 ? '' : 's'} \u00b7 ${groups.size} area${groups.size === 1 ? '' : 's'}`
+    ? (filtering
+        ? `${shown.length} of ${chores.length} chore${chores.length === 1 ? '' : 's'}`
+        : `${chores.length} chore${chores.length === 1 ? '' : 's'} \u00b7 ${areas} area${areas === 1 ? '' : 's'}`)
     : '';
 
   if (!chores.length) {
@@ -552,34 +793,160 @@ function renderChores() {
     return;
   }
 
+  if (!shown.length) {
+    const empty = el('div', 'empty-chores');
+    empty.appendChild(el('div', 'empty-chores-title', 'No matching chores'));
+    empty.appendChild(el('div', 'empty-chores-text',
+      'Nothing matches that assignee and tag filter.'));
+    const clear = el('button', 'primary-btn', 'Clear filters');
+    clear.type = 'button';
+    clear.addEventListener('click', clearChoreFilters);
+    empty.appendChild(clear);
+    wrap.appendChild(empty);
+    return;
+  }
+
+  const visibleIds = shown.map(c => c.id);
   groups.forEach((items, area) => {
     const g = el('div', 'group');
     g.appendChild(el('div', 'group-title', area));
-    items.forEach(c => g.appendChild(choreRow(c)));
+    sortChoreItems(items).forEach(c => g.appendChild(choreRow(c, visibleIds)));
     wrap.appendChild(g);
   });
 }
 
+/** True when a chore passes the current assignee/tag filters. */
+function matchesChoreFilters(chore) {
+  if (assigneeFilter === UNASSIGNED) {
+    if (chore.assignee) return false;
+  } else if (assigneeFilter) {
+    if ((chore.assignee || '').toLocaleLowerCase() !==
+        assigneeFilter.toLocaleLowerCase()) return false;
+  }
+  const tags = choreTags(chore);
+  if (tagFilter === UNTAGGED) {
+    if (tags.length) return false;
+  } else if (tagFilter) {
+    if (!tags.some(tag => sameTag(tag, tagFilter))) return false;
+  }
+  return true;
+}
+
+/** Sort a single area's rows while keeping the selected grouping intact. */
+function sortChoreItems(items) {
+  const textKey = c => c.text.toLocaleLowerCase();
+  if (choreSort === 'tag') {
+    items.sort((a, b) => {
+      const at = choreTags(a).slice().sort((x, y) => x.localeCompare(y))[0] || '\uffff';
+      const bt = choreTags(b).slice().sort((x, y) => x.localeCompare(y))[0] || '\uffff';
+      return at.localeCompare(bt, undefined, { sensitivity: 'base' }) ||
+        textKey(a).localeCompare(textKey(b));
+    });
+  } else if (choreSort === 'assignee') {
+    items.sort((a, b) => {
+      const aa = a.assignee || '\uffff';
+      const bb = b.assignee || '\uffff';
+      return aa.localeCompare(bb, undefined, { sensitivity: 'base' }) ||
+        textKey(a).localeCompare(textKey(b));
+    });
+  }
+  return items;
+}
+
+/** Keep the toolbar selects in step with the chores and current filter state. */
+function syncChoreFilters() {
+  const assignees = allAssignees();
+  const tags = allTags();
+  if (assigneeFilter && assigneeFilter !== UNASSIGNED &&
+      !assignees.some(a => a.toLocaleLowerCase() === assigneeFilter.toLocaleLowerCase())) {
+    assigneeFilter = '';
+    writePref(ASSIGNEE_FILTER_KEY, '');
+  }
+  if (tagFilter && tagFilter !== UNTAGGED &&
+      !tags.some(t => sameTag(t, tagFilter))) {
+    tagFilter = '';
+    writePref(TAG_FILTER_KEY, '');
+  }
+  if (!['manual', 'tag', 'assignee'].includes(choreSort)) choreSort = 'manual';
+
+  fillFilterSelect('assigneeFilter',
+    [['', 'Everyone'], [UNASSIGNED, 'Unassigned'],
+     ...assignees.map(a => [a, a])], assigneeFilter);
+  fillFilterSelect('tagFilter',
+    [['', 'All tags'], ...tags.map(t => [t, '#' + t]), [UNTAGGED, 'Untagged']],
+    tagFilter);
+  document.getElementById('sortSelect').value = choreSort;
+}
+
+function fillFilterSelect(id, options, value) {
+  const select = document.getElementById(id);
+  select.innerHTML = '';
+  options.forEach(([optionValue, label]) => {
+    const opt = document.createElement('option');
+    opt.value = optionValue;
+    opt.textContent = label;
+    select.appendChild(opt);
+  });
+  select.value = value;
+}
+
+function clearChoreFilters() {
+  assigneeFilter = '';
+  tagFilter = '';
+  writePref(ASSIGNEE_FILTER_KEY, '');
+  writePref(TAG_FILTER_KEY, '');
+  renderChores();
+}
+
 /** A management row: text + recurrence hint, next due, and row actions. */
-function choreRow(chore) {
+function choreRow(chore, visibleIds) {
   const row = el('div', 'task chore-row');
   row.appendChild(choreBody(chore));
 
   const meta = el('div', 'next-due');
-  meta.appendChild(el('span', 'next-due-label', 'Next'));
-  meta.appendChild(el('span', 'next-due-date', formatNextDue(chore.next_due)));
+  if (chore.due_mode === 'flex') {
+    const occurrences = flexible.filter(o => o.id === chore.id);
+    const overdue = occurrences
+      .filter(o => o.overdue)
+      .sort((a, b) => (a.due || '').localeCompare(b.due || ''));
+    const current = occurrences.find(o => o.current);
+    meta.classList.add('flex-next');
+    if (overdue.length) {
+      meta.classList.add('overdue-next');
+      meta.appendChild(el('span', 'next-due-label', 'Overdue'));
+      let due = `Due ${formatDay(overdue[0].due, { month: 'short', day: 'numeric' })}`;
+      if (overdue.length > 1) due += ` +${overdue.length - 1}`;
+      meta.appendChild(el('span', 'flex-scope', due));
+    } else {
+      meta.appendChild(el('span', 'next-due-label', 'Flexible'));
+      if (current) {
+        const scope = el('span', 'flex-scope' +
+          (current.done ? ' done-scope' : ''), scopeLabel(chore.flex_unit));
+        meta.appendChild(scope);
+      } else {
+        meta.appendChild(el('span', 'flex-scope',
+          chore.next_due ? formatNextDue(chore.next_due) : '\u2014'));
+      }
+    }
+  } else {
+    meta.appendChild(el('span', 'next-due-label', 'Next'));
+    meta.appendChild(el('span', 'next-due-date', formatNextDue(chore.next_due)));
+  }
   row.appendChild(meta);
 
-  const ids = chores.map(c => c.id);
-  const index = ids.indexOf(chore.id);
+  const index = visibleIds.indexOf(chore.id);
+  const manual = choreSort === 'manual';
   const actions = el('div', 'row-actions');
   const up = el('button', '', '\u2191');
-  up.type = 'button'; up.title = 'Move up'; up.disabled = index <= 0;
-  up.addEventListener('click', e => { e.stopPropagation(); moveItem(chore, -1); });
+  up.type = 'button';
+  up.title = manual ? 'Move up' : 'Switch to manual order to reorder';
+  up.disabled = !manual || index <= 0;
+  up.addEventListener('click', e => { e.stopPropagation(); moveItem(chore, -1, visibleIds); });
   const down = el('button', '', '\u2193');
-  down.type = 'button'; down.title = 'Move down';
-  down.disabled = index < 0 || index >= ids.length - 1;
-  down.addEventListener('click', e => { e.stopPropagation(); moveItem(chore, 1); });
+  down.type = 'button';
+  down.title = manual ? 'Move down' : 'Switch to manual order to reorder';
+  down.disabled = !manual || index < 0 || index >= visibleIds.length - 1;
+  down.addEventListener('click', e => { e.stopPropagation(); moveItem(chore, 1, visibleIds); });
   const edit = el('button', 'edit-row-btn', 'Edit');
   edit.type = 'button';
   edit.addEventListener('click', e => { e.stopPropagation(); openEditor(chore); });
@@ -595,59 +962,104 @@ function choreRow(chore) {
 function choreBody(chore) {
   const body = el('div', 'task-body');
   body.appendChild(el('div', 'task-text', chore.text));
-  body.appendChild(el('div', 'task-when', ruleHint(chore)));
+  body.appendChild(el('div', 'task-when', scheduleHint(chore)));
+  const meta = choreMeta(chore, null);
+  if (meta) body.appendChild(meta);
   return body;
 }
 
 /* ---------------------------------------------------------------- overdue */
 
-/** Roll-up of overdue occurrences in the loaded range (earlier than today). */
+/**
+ * Roll-up of *high-priority* overdue occurrences in the loaded range.
+ * Normal-priority overdue chores still tint the calendar and are flagged in
+ * the day list, but they never feed this banner.
+ */
 function renderOverdue() {
   const banner = document.getElementById('overdueBanner');
+  const byId = new Map(chores.map(c => [c.id, c]));
   let count = 0;
   let earliest = null;
   Object.keys(dates).forEach(iso => {
     if (iso >= today) return;
-    const n = dates[iso].filter(o => o.overdue).length;
+    const n = dates[iso].filter(o => {
+      if (!o.overdue) return false;
+      if (o.high_priority !== undefined) return o.high_priority;
+      return !!(byId.get(o.id) || {}).high_priority;
+    }).length;
     if (!n) return;
     count += n;
     if (!earliest || iso < earliest) earliest = iso;
   });
+  const flexOverdue = flexible.filter(o => {
+    if (!o.overdue) return false;
+    if (o.high_priority !== undefined) return o.high_priority;
+    return !!(byId.get(o.id) || {}).high_priority;
+  });
+  count += flexOverdue.length;
 
   banner.innerHTML = '';
   if (!count) { banner.hidden = true; return; }
   banner.hidden = false;
   banner.appendChild(el('span', 'overdue-banner-text',
-    `\u26a0 ${count} chore${count === 1 ? '' : 's'} overdue from earlier`));
+    `\u26a0 ${count} high-priority chore${count === 1 ? '' : 's'} overdue from earlier`));
   const review = el('button', '', 'Review \u2192');
   review.type = 'button';
-  review.addEventListener('click', () => selectDay(earliest));
+  review.addEventListener('click', () => {
+    if (earliest) { selectDay(earliest); return; }
+    // Flexible-only overdue: bring the shelf into view and focus its first
+    // overdue checkbox.
+    setSurface('calendar');
+    document.getElementById('flexStrip').scrollIntoView(
+      { behavior: 'smooth', block: 'nearest' });
+    const first = document.querySelector('#flexItems .flex-item.overdue input');
+    if (first) first.focus();
+  });
   banner.appendChild(review);
 }
 
 /* ----------------------------------------------------------------- editor */
 
 function openEditor(chore) {
+  const isFlex = chore && chore.due_mode === 'flex';
+  const flexUnit = isFlex ? (chore.flex_unit || null) : 'month';
   editorState = chore
     ? {
         id: chore.id, text: chore.text, area: chore.area, freq: chore.freq,
         interval: chore.interval, weekdays: [...(chore.weekdays || [])],
         month_days: [...(chore.month_days || [])],
         anchor: chore.anchor || selected, until: chore.until || '',
+        assignee: chore.assignee || '', tags: [...choreTags(chore)],
+        high_priority: !!chore.high_priority,
+        due_mode: isFlex ? 'flex' : 'date',
+        flex_unit: flexUnit,
+        flex_interval: isFlex ? (chore.flex_interval || 0) : 0,
+        flex_anchor: chore.flex_anchor ||
+          (flexUnit ? periodStartOf(flexUnit, todayISO()) : null),
       }
     : {
         id: null, text: '', area: '', freq: 'weekly', interval: 1,
         weekdays: [dowIndex(selected)], month_days: [parseISO(selected).getDate()],
         anchor: selected, until: '',
+        assignee: '', tags: [], high_priority: false,
+        due_mode: 'date', flex_unit: 'month', flex_interval: 0,
+        flex_anchor: periodStartOf('month', todayISO()),
       };
 
   document.getElementById('sheetTitle').textContent = chore ? 'Edit chore' : 'New chore';
   document.getElementById('f-name').value = editorState.text;
   document.getElementById('f-area').value = editorState.area;
+  document.getElementById('f-assignee').value = editorState.assignee;
+  document.getElementById('f-priority').checked = editorState.high_priority;
+  document.getElementById('f-tag').value = '';
   document.getElementById('f-freq').value = editorState.freq;
   document.getElementById('delBtn').style.display = chore ? '' : 'none';
   hideEditorError();
-  fillAreaOptions();
+  closeCombo('f-area', 'areaSuggestions');
+  closeCombo('f-assignee', 'assigneeSuggestions');
+  closeCombo('f-tag', 'tagSuggestions');
+  renderTagChips();
+  renderTiming();
   renderCustomFields();
 
   document.getElementById('scrim').hidden = false;
@@ -661,15 +1073,335 @@ function closeEditor() {
   document.getElementById('sheet').hidden = true;
 }
 
-/** Offer the areas already in use so typos don't spawn duplicate groups. */
-function fillAreaOptions() {
-  const datalist = document.getElementById('areaOptions');
-  datalist.innerHTML = '';
-  [...new Set(chores.map(c => c.area))].sort().forEach(area => {
-    const opt = document.createElement('option');
-    opt.value = area;
-    datalist.appendChild(opt);
+/** Areas already in use, alphabetically. */
+function savedAreas() {
+  return [...new Set(chores.map(c => c.area).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+}
+
+/** Areas used elsewhere, offered as a filtered autocomplete list. */
+function renderAreaSuggestions(filter) {
+  const input = document.getElementById('f-area');
+  const values = filterSuggestions(savedAreas(), input.value, filter);
+  renderComboOptions('areaSuggestions', values, input.value.trim(), area => {
+    input.value = area;
+    input.focus();
+    closeCombo('f-area', 'areaSuggestions');
   });
+}
+
+/** Existing people (plus the current draft's assignee), alphabetically. */
+function savedPeople() {
+  const people = new Set(allAssignees());
+  if (editorState && editorState.assignee) people.add(editorState.assignee);
+  return [...people].sort((a, b) => a.localeCompare(b));
+}
+
+/** People used elsewhere, offered as a filtered autocomplete list. */
+function renderAssigneeSuggestions(filter) {
+  const input = document.getElementById('f-assignee');
+  const values = filterSuggestions(savedPeople(), input.value, filter);
+  renderComboOptions('assigneeSuggestions', values, input.value.trim(), person => {
+    input.value = person;
+    input.focus();
+    closeCombo('f-assignee', 'assigneeSuggestions');
+  });
+}
+
+/** Existing tags not already on this chore, offered as a filtered list. */
+function renderTagSuggestions(filter) {
+  if (!editorState) return;
+  const input = document.getElementById('f-tag');
+  const available = allTags()
+    .filter(tag => !editorState.tags.some(selected => sameTag(selected, tag)));
+  const values = filterSuggestions(available, input.value, filter);
+  renderComboOptions('tagSuggestions', values, '', tag => {
+    input.value = '';
+    addEditorTag(tag);
+    renderTagSuggestions(true);
+    openCombo('f-tag', 'tagSuggestions');
+    input.focus();
+  });
+}
+
+/** Case-insensitive substring filter used while typing in a combo. */
+function filterSuggestions(values, query, filter) {
+  if (!filter) return values;
+  const needle = query.trim().toLocaleLowerCase();
+  if (!needle) return values;
+  return values.filter(value => value.toLocaleLowerCase().includes(needle));
+}
+
+/** Fill a combo menu with option buttons, marking an exact current match. */
+function renderComboOptions(menuId, values, activeValue, onPick) {
+  const menu = document.getElementById(menuId);
+  menu.innerHTML = '';
+  const wanted = (activeValue || '').toLocaleLowerCase();
+  values.forEach(value => {
+    const active = wanted && value.toLocaleLowerCase() === wanted;
+    const option = el('button', 'combo-option' + (active ? ' active' : ''), value);
+    option.type = 'button';
+    option.setAttribute('role', 'option');
+    option.setAttribute('aria-selected', active ? 'true' : 'false');
+    option.addEventListener('click', () => onPick(value));
+    menu.appendChild(option);
+  });
+}
+
+/** Show a combo only when it actually has recommendations. */
+function openCombo(inputId, menuId) {
+  const input = document.getElementById(inputId);
+  const menu = document.getElementById(menuId);
+  const hasOptions = menu.children.length > 0;
+  menu.hidden = !hasOptions;
+  input.setAttribute('aria-expanded', hasOptions ? 'true' : 'false');
+}
+
+function closeCombo(inputId, menuId) {
+  document.getElementById(menuId).hidden = true;
+  document.getElementById(inputId).setAttribute('aria-expanded', 'false');
+}
+
+/**
+ * Wire a text input to a suggestion menu. The menu opens on focus, filters as
+ * the user types, closes on blur/Escape, and supports arrow-key navigation.
+ */
+function bindCombo(inputId, menuId, render) {
+  const input = document.getElementById(inputId);
+  const menu = document.getElementById(menuId);
+  const combo = input.closest('.combo');
+  const show = filter => {
+    render(filter);
+    openCombo(inputId, menuId);
+  };
+
+  input.addEventListener('focus', () => show(false));
+  input.addEventListener('input', () => show(true));
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !menu.hidden) {
+      e.stopPropagation(); // first Escape closes the menu, not the editor
+      closeCombo(inputId, menuId);
+    } else if (e.key === 'ArrowDown' && !menu.hidden) {
+      e.preventDefault();
+      const first = menu.querySelector('.combo-option');
+      if (first) first.focus();
+    }
+  });
+
+  // Keep mouse selection from blurring the input before its click lands.
+  menu.addEventListener('mousedown', e => e.preventDefault());
+  menu.addEventListener('keydown', e => {
+    const options = [...menu.querySelectorAll('.combo-option')];
+    const index = options.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      (options[index + 1] || options[0])?.focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (index <= 0) input.focus();
+      else options[index - 1].focus();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeCombo(inputId, menuId);
+      input.focus();
+    }
+  });
+
+  if (combo) {
+    combo.addEventListener('focusout', e => {
+      if (!combo.contains(e.relatedTarget)) closeCombo(inputId, menuId);
+    });
+  }
+}
+
+/** Re-render every tag surface after the draft's tag list changes. */
+function refreshTagUi() {
+  renderTagChips();
+  const menu = document.getElementById('tagSuggestions');
+  if (menu && !menu.hidden) {
+    renderTagSuggestions(true);
+    openCombo('f-tag', 'tagSuggestions');
+  }
+}
+
+/* ---- editor tag chips ---- */
+
+function renderTagChips() {
+  const wrap = document.getElementById('tagChips');
+  wrap.innerHTML = '';
+  if (!editorState || !editorState.tags.length) {
+    wrap.appendChild(el('span', 'tag-empty', 'No tags yet'));
+    return;
+  }
+  editorState.tags.forEach((tag, index) => {
+    const chip = el('span', 'tag-chip', tag);
+    const remove = el('button', 'tag-remove', '\u00d7');
+    remove.type = 'button';
+    remove.setAttribute('aria-label', `Remove tag ${tag}`);
+    remove.title = `Remove ${tag}`;
+    remove.addEventListener('click', () => {
+      editorState.tags.splice(index, 1);
+      refreshTagUi();
+    });
+    chip.appendChild(remove);
+    wrap.appendChild(chip);
+  });
+}
+
+/** Add one tag to the draft. Returns false when it would exceed a limit. */
+function addEditorTag(raw) {
+  if (!editorState) return false;
+  const tag = raw.trim().replace(/\s+/g, ' ');
+  if (!tag) return true;
+  if (editorState.tags.some(t => sameTag(t, tag))) return true;
+  if (tag.length > MAX_TAG_LEN) {
+    showEditorError(`Tags can be at most ${MAX_TAG_LEN} characters.`);
+    return false;
+  }
+  if (editorState.tags.length >= MAX_TAGS) {
+    showEditorError(`A chore can have at most ${MAX_TAGS} tags.`);
+    return false;
+  }
+  editorState.tags.push(tag);
+  hideEditorError();
+  refreshTagUi();
+  return true;
+}
+
+/** Pull whatever is typed in the tag box into the draft (comma-separated ok). */
+function commitTagInput() {
+  const input = document.getElementById('f-tag');
+  const menu = document.getElementById('tagSuggestions');
+  if (!input.value.trim()) { input.value = ''; return true; }
+  let ok = true;
+  input.value.split(',').forEach(part => {
+    if (ok) ok = addEditorTag(part);
+  });
+  if (ok) input.value = '';
+  if (!menu.hidden) {
+    renderTagSuggestions(true);
+    openCombo('f-tag', 'tagSuggestions');
+  }
+  return ok;
+}
+
+/* ---- editor timing: dated schedule vs flexible window ---- */
+
+function renderTiming() {
+  if (!editorState) return;
+  const isFlex = editorState.due_mode === 'flex';
+  document.querySelectorAll('.timing-btn').forEach(btn => {
+    const active = btn.dataset.timing === editorState.due_mode;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+  document.getElementById('dateTiming').hidden = isFlex;
+  document.getElementById('flexTiming').hidden = !isFlex;
+  if (isFlex) {
+    renderFlexWindowChips();
+    renderFlexRepeatOptions();
+    renderFlexHint();
+  }
+}
+
+function setTiming(mode) {
+  if (!editorState || !['date', 'flex'].includes(mode)) return;
+  if (editorState.due_mode === mode) return;
+  editorState.due_mode = mode;
+  if (mode === 'flex' && editorState.flex_unit && !editorState.flex_anchor) {
+    editorState.flex_anchor = periodStartOf(editorState.flex_unit, todayISO());
+  }
+  renderTiming();
+}
+
+function renderFlexWindowChips() {
+  const wrap = document.getElementById('flexWindowChips');
+  wrap.innerHTML = '';
+  [['Anytime', null], ['Week', 'week'], ['Month', 'month'], ['Year', 'year']]
+    .forEach(([label, value]) => {
+      const active = editorState.flex_unit === value;
+      const chip = el('button', 'chip' + (active ? ' active' : ''), label);
+      chip.type = 'button';
+      chip.setAttribute('aria-pressed', active ? 'true' : 'false');
+      chip.addEventListener('click', () => {
+        if (editorState.flex_unit === value) return;
+        editorState.flex_unit = value;
+        editorState.flex_anchor = value
+          ? periodStartOf(value, todayISO())
+          : null;
+        if (!value) editorState.flex_interval = 0;
+        renderTiming();
+      });
+      wrap.appendChild(chip);
+    });
+}
+
+function renderFlexRepeatOptions() {
+  const select = document.getElementById('f-flex-repeat');
+  select.innerHTML = '';
+  const unit = editorState.flex_unit;
+  if (!unit) {
+    const opt = document.createElement('option');
+    opt.value = '0';
+    opt.textContent = "Doesn't repeat";
+    select.appendChild(opt);
+    select.value = '0';
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  for (let n = 0; n <= MAX_FLEX_INTERVAL; n++) {
+    const opt = document.createElement('option');
+    opt.value = String(n);
+    opt.textContent = n === 0
+      ? "Doesn't repeat"
+      : n === 1 ? `Every ${unit}` : `Every ${n} ${unit}s`;
+    select.appendChild(opt);
+  }
+  if (![...select.options].some(o => Number(o.value) === editorState.flex_interval)) {
+    editorState.flex_interval = 0;
+  }
+  select.value = String(editorState.flex_interval);
+}
+
+function renderFlexHint() {
+  const hint = document.getElementById('flexTimingHint');
+  if (!editorState) { hint.textContent = ''; return; }
+  const unit = editorState.flex_unit;
+  if (!unit) {
+    hint.textContent = 'Anytime chores stay in the Flexible shelf until done and never become overdue.';
+    return;
+  }
+  const due = nextFlexDue(unit, editorState.flex_interval,
+    editorState.flex_anchor, todayISO());
+  const dueText = due
+    ? `Due ${formatDay(due, { weekday: 'short', month: 'short', day: 'numeric' })}.`
+    : '';
+  const reset = editorState.flex_interval
+    ? (editorState.flex_interval === 1
+        ? `Resets every ${unit}.`
+        : `Resets every ${editorState.flex_interval} ${unit}s.`)
+    : 'Stays until done.';
+  hint.textContent = `${dueText} ${reset}`.trim();
+}
+
+/** Normalize the draft into the exact keys /api/chores(+/update) accept. */
+function buildTimingPayload(s) {
+  if (s.due_mode === 'flex') {
+    return {
+      due_mode: 'flex',
+      flex_unit: s.flex_unit,
+      flex_interval: s.flex_unit ? s.flex_interval : 0,
+      flex_anchor: s.flex_unit ? s.flex_anchor : null,
+    };
+  }
+  return {
+    due_mode: 'date',
+    flex_unit: null,
+    flex_interval: 0,
+    flex_anchor: null,
+  };
 }
 
 /** Rebuilds the schedule controls for the current freq (progressive disclosure). */
@@ -822,11 +1554,23 @@ async function saveEditor() {
     (!name ? document.getElementById('f-name') : document.getElementById('f-area')).focus();
     return;
   }
+  if (!commitTagInput()) {
+    document.getElementById('f-tag').focus();
+    return;
+  }
   const rule = buildRulePayload(editorState);
+  const timing = buildTimingPayload(editorState);
+  if (timing.due_mode === 'flex') rule.until = null;
+  const metadata = {
+    assignee: document.getElementById('f-assignee').value.trim() || null,
+    high_priority: document.getElementById('f-priority').checked,
+    tags: [...editorState.tags],
+  };
+  const payload = { area, text: name, ...metadata, ...rule, ...timing };
   const isNew = !editorState.id;
   const data = isNew
-    ? await postChoreApi('/api/chores', { area, text: name, ...rule })
-    : await postChoreApi('/api/chores/update', { id: editorState.id, area, text: name, ...rule });
+    ? await postChoreApi('/api/chores', payload)
+    : await postChoreApi('/api/chores/update', { id: editorState.id, ...payload });
   if (!data) {
     showEditorError('Could not save \u2014 check your connection and try again.');
     return;
@@ -895,13 +1639,43 @@ async function setChoreDone(chore, occ, row, checkbox, day) {
   }
 }
 
-async function moveItem(item, delta) {
+async function setFlexDone(chore, occ, card, checkbox) {
+  const done = checkbox.checked;
+  const previousDone = !!occ.done;
+  const previousOverdue = !!occ.overdue;
+  if (done === previousDone) return;
+
+  occ.done = done;
+  occ.overdue = done ? false : !!(occ.due && occ.due < todayISO());
+  card.classList.toggle('done', done);
+  card.classList.toggle('overdue', occ.overdue);
+  cacheState();
+  renderOverdue();
+
+  const result = await saveFlexToggle(chore.id, done, occ.period_key);
+  if (!result) {
+    occ.done = previousDone;
+    occ.overdue = previousOverdue;
+    checkbox.checked = previousDone;
+    card.classList.toggle('done', previousDone);
+    card.classList.toggle('overdue', previousOverdue);
+    cacheState();
+    renderOverdue();
+    toast('Could not save \u2014 tap to try again');
+  }
+}
+
+/** Move a chore one step within the currently visible management list. */
+async function moveItem(item, delta, visibleIds) {
   const ids = chores.map(c => c.id);
-  const index = ids.indexOf(item.id);
-  const target = index + delta;
-  if (index < 0 || target < 0 || target >= ids.length) return;
-  ids.splice(index, 1);
-  ids.splice(target, 0, item.id);
+  const visible = visibleIds && visibleIds.length ? visibleIds : ids;
+  const visibleIndex = visible.indexOf(item.id);
+  const targetId = visible[visibleIndex + delta];
+  const from = ids.indexOf(item.id);
+  const to = ids.indexOf(targetId);
+  if (visibleIndex < 0 || targetId === undefined || from < 0 || to < 0) return;
+  ids.splice(from, 1);
+  ids.splice(to, 0, item.id);
   const data = await postChoreApi('/api/chores/reorder', { ids });
   if (!data) { toast('Could not reorder \u2014 try again'); return; }
   await refresh();
@@ -961,6 +1735,27 @@ function startPolling() {
 
 /* -------------------------------------------------------------------- init */
 
+function bindChoresControls() {
+  const assigneeSelect = document.getElementById('assigneeFilter');
+  assigneeSelect.addEventListener('change', () => {
+    assigneeFilter = assigneeSelect.value;
+    writePref(ASSIGNEE_FILTER_KEY, assigneeFilter);
+    renderChores();
+  });
+  const tagSelect = document.getElementById('tagFilter');
+  tagSelect.addEventListener('change', () => {
+    tagFilter = tagSelect.value;
+    writePref(TAG_FILTER_KEY, tagFilter);
+    renderChores();
+  });
+  const sortSelect = document.getElementById('sortSelect');
+  sortSelect.addEventListener('change', () => {
+    choreSort = sortSelect.value;
+    writePref(SORT_KEY, choreSort);
+    renderChores();
+  });
+}
+
 function bindEditor() {
   document.getElementById('scrim').addEventListener('click', closeEditor);
   document.getElementById('closeBtn').addEventListener('click', closeEditor);
@@ -968,7 +1763,24 @@ function bindEditor() {
   document.getElementById('saveBtn').addEventListener('click', saveEditor);
   document.getElementById('delBtn').addEventListener('click', deleteEditor);
   document.getElementById('f-freq').addEventListener('change', e => onFreqChange(e.target.value));
+  document.querySelectorAll('.timing-btn').forEach(btn =>
+    btn.addEventListener('click', () => setTiming(btn.dataset.timing)));
+  document.getElementById('f-flex-repeat').addEventListener('change', e => {
+    if (!editorState) return;
+    editorState.flex_interval = parseInt(e.target.value, 10) || 0;
+    renderFlexHint();
+  });
+  bindCombo('f-area', 'areaSuggestions', renderAreaSuggestions);
+  bindCombo('f-assignee', 'assigneeSuggestions', renderAssigneeSuggestions);
+  bindCombo('f-tag', 'tagSuggestions', renderTagSuggestions);
   document.getElementById('addBtn').addEventListener('click', () => openEditor(null));
+  document.getElementById('addTagBtn').addEventListener('click', commitTagInput);
+  document.getElementById('f-tag').addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault();
+      commitTagInput();
+    }
+  });
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && editorState) closeEditor();
   });
@@ -977,6 +1789,7 @@ function bindEditor() {
 (async function init() {
   restoreCache();
   bindHeader();
+  bindChoresControls();
   bindEditor();
   renderAll();          // paint immediately from cache (or the empty state)
   await loadCalendar(); // then reconcile with the server
