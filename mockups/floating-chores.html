@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Floating chores — design mockup</title>
+<link rel="stylesheet" href="../html/css/style.css">
+<style>
+  /* ---- mockup-only additions: flexible chores ---- */
+  .flex-strip{
+    display:flex;
+    align-items:flex-start;
+    gap:14px;
+    margin:0 0 14px;
+    padding:10px 12px;
+    background:#f0f3ed;
+    border-top:1px dashed #b9c6b3;
+    border-bottom:1px dashed #b9c6b3;
+  }
+  .flex-strip-head{flex:0 0 auto; min-width:84px; padding:2px 6px 0 0;}
+  .flex-strip-title{
+    display:block;
+    font-size:0.72rem;
+    font-weight:700;
+    letter-spacing:0.7px;
+    text-transform:uppercase;
+    color:var(--moss-dark);
+  }
+  .flex-strip-note{display:block; margin-top:1px; font-size:0.69rem; font-style:italic; color:var(--muted);}
+  .flex-items{display:flex; flex:1 1 auto; flex-wrap:wrap; gap:7px; min-width:0;}
+  .flex-item{
+    display:flex;
+    flex:1 1 185px;
+    align-items:flex-start;
+    gap:7px;
+    max-width:280px;
+    padding:6px 9px;
+    background:var(--card);
+    border:1px solid #d4ddcf;
+    cursor:pointer;
+  }
+  .flex-item input[type=checkbox]{
+    flex-shrink:0;
+    width:15px;
+    height:15px;
+    margin-top:2px;
+    accent-color:var(--sky);
+  }
+  .flex-item-body{display:flex; flex-direction:column; gap:1px; min-width:0;}
+  .flex-item-text{font-size:0.84rem; line-height:1.25;}
+  .flex-item.done .flex-item-text{color:var(--muted); text-decoration:line-through; text-decoration-color:var(--done);}
+  .flex-meta{display:flex; flex-wrap:wrap; align-items:center; gap:5px; font-size:0.68rem; color:var(--muted);}
+  .scope-pill{
+    padding:1px 5px;
+    border:1px solid #b9cad2;
+    border-radius:8px;
+    background:#e9f0f3;
+    color:var(--sky);
+    font-size:0.61rem;
+    font-weight:700;
+    letter-spacing:0.45px;
+    text-transform:uppercase;
+    white-space:nowrap;
+  }
+  .scope-pill.anytime{background:#f1ede1; border-color:var(--line); color:var(--muted);}
+  .flex-repeat{font-style:italic;}
+  .flex-assignee{font-weight:600; color:var(--moss-dark);}
+
+  /* management row timing column */
+  .flex-next .next-due-label{color:var(--sky);}
+  .flex-next .flex-scope{font-size:0.76rem; font-weight:700; color:var(--sky);}
+
+  /* editor timing control */
+  .timing-switch{display:inline-flex; align-self:flex-start; border:1.5px solid var(--ink);}
+  .timing-btn{
+    padding:6px 13px;
+    border:none;
+    border-right:1.5px solid var(--ink);
+    background:transparent;
+    color:var(--ink);
+    font-family:inherit;
+    font-size:0.82rem;
+    cursor:pointer;
+  }
+  .timing-btn:last-child{border-right:none;}
+  .timing-btn.active{background:var(--ink); color:var(--paper);}
+  .flex-editor{display:flex; flex-direction:column; gap:12px;}
+  .flex-editor .chips .chip{font-size:0.76rem;}
+
+  @media (max-width: 860px){
+    .flex-strip{flex-direction:column; gap:8px;}
+    .flex-strip-head{min-width:0; padding:0;}
+    .flex-items{width:100%;}
+    .flex-item{max-width:none;}
+  }
+  @media (max-width: 560px){
+    .flex-items{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px;}
+    .flex-item{max-width:none; min-width:0; padding:5px 7px;}
+    .flex-item-text{font-size:0.8rem;}
+    .flex-meta{font-size:0.64rem; gap:4px;}
+  }
+  @media (max-width: 380px){
+    .flex-items{grid-template-columns:minmax(0,1fr);}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-top">
+    <h1>Household Chore Chart</h1>
+    <div class="surface-switch" id="surfaceSwitch" role="group" aria-label="Chore chart view">
+      <button class="surface-btn active" data-surface="calendar" type="button" aria-pressed="true">Calendar</button>
+      <button class="surface-btn" data-surface="chores" type="button" aria-pressed="false">Chores</button>
+    </div>
+  </div>
+</header>
+
+<section class="surface" id="calendarSurface">
+  <div class="cal-controls">
+    <div class="view-switch" id="viewSwitch" role="group" aria-label="Calendar range">
+      <button class="view-btn" data-view="day" type="button" aria-pressed="false">Day</button>
+      <button class="view-btn active" data-view="week" type="button" aria-pressed="true">Week</button>
+      <button class="view-btn" data-view="month" type="button" aria-pressed="false">Month</button>
+    </div>
+    <div class="nav">
+      <button class="nav-btn" type="button" aria-label="Previous">&lsaquo;</button>
+      <button class="nav-btn today-btn" type="button">Today</button>
+      <button class="nav-btn" type="button" aria-label="Next">&rsaquo;</button>
+    </div>
+    <div class="range-label" id="rangeLabel">Nov 1 – Nov 7, 2026</div>
+  </div>
+
+  <div class="overdue-banner">
+    <span class="overdue-banner-text">⚠ 1 high-priority chore overdue from earlier</span>
+    <button type="button">Review →</button>
+  </div>
+
+  <!-- NEW: floating / flexible chores live in their own shelf, outside the dated grid -->
+  <section class="flex-strip" id="flexStrip" aria-label="Flexible chores">
+    <div class="flex-strip-head">
+      <span class="flex-strip-title">Flexible</span>
+      <span class="flex-strip-note">not tied to a day</span>
+    </div>
+    <div class="flex-items">
+      <label class="flex-item done">
+        <input type="checkbox" checked>
+        <span class="flex-item-body">
+          <span class="flex-item-text">Wash windows</span>
+          <span class="flex-meta">
+            <span class="scope-pill">This week</span>
+            <span class="flex-repeat">once</span>
+            <span class="flex-assignee">Sam</span>
+          </span>
+        </span>
+      </label>
+      <label class="flex-item">
+        <input type="checkbox">
+        <span class="flex-item-body">
+          <span class="flex-item-text">Clean out the car</span>
+          <span class="flex-meta">
+            <span class="scope-pill">This month</span>
+            <span class="flex-repeat">every month</span>
+            <span class="flex-assignee">Alex</span>
+          </span>
+        </span>
+      </label>
+      <label class="flex-item">
+        <input type="checkbox">
+        <span class="flex-item-body">
+          <span class="flex-item-text">Deep clean the oven</span>
+          <span class="flex-meta">
+            <span class="scope-pill">This year</span>
+            <span class="flex-repeat">every year</span>
+          </span>
+        </span>
+      </label>
+      <label class="flex-item">
+        <input type="checkbox">
+        <span class="flex-item-body">
+          <span class="flex-item-text">Donate old coats</span>
+          <span class="flex-meta">
+            <span class="scope-pill anytime">Anytime</span>
+            <span class="flex-assignee">Riley</span>
+          </span>
+        </span>
+      </label>
+    </div>
+  </section>
+
+  <main class="layout">
+    <section class="cal-pane" id="calPane" aria-label="Calendar">
+      <div class="week-grid" id="weekGrid"></div>
+      <div class="month-grid" id="monthGrid" hidden></div>
+    </section>
+    <section class="list-pane" aria-label="Chores for the selected day">
+      <div class="list-head">
+        <span class="list-date">Thursday, November 5</span>
+        <div class="list-progress">
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="3" aria-valuenow="1">
+            <div class="progress-fill" style="width:33%"></div>
+          </div>
+          <span class="list-count">1 / 3 done</span>
+        </div>
+        <button class="hide-done-btn" type="button">Hide done</button>
+      </div>
+      <div class="group">
+        <div class="group-title">Kitchen</div>
+        <div class="task done">
+          <input type="checkbox" checked>
+          <div class="task-body">
+            <div class="task-text">Wipe counters</div>
+            <div class="task-when">every day</div>
+          </div>
+        </div>
+        <div class="task">
+          <input type="checkbox">
+          <div class="task-body">
+            <div class="task-text">Take out trash</div>
+            <div class="task-when">every week on Mon, Thu</div>
+            <div class="task-meta">
+              <span class="assignee-pill">Sam</span>
+              <span class="tag-pill">#trash</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="group">
+        <div class="group-title">Pool</div>
+        <div class="task">
+          <input type="checkbox">
+          <div class="task-body">
+            <div class="task-text">Skim the pool</div>
+            <div class="task-when">every day</div>
+            <div class="task-meta">
+              <span class="prio-flag">High priority</span>
+              <span class="tag-pill">#outdoor</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</section>
+
+<section class="surface" id="choresSurface" hidden>
+  <div class="surface-head">
+    <span class="surface-title">Routines</span>
+    <span class="surface-count">7 chores · 5 areas</span>
+    <button class="primary-btn" type="button" data-open-editor>+ Add chore</button>
+  </div>
+  <div class="chore-toolbar">
+    <label class="toolbar-field">Assigned
+      <select><option>Everyone</option></select>
+    </label>
+    <label class="toolbar-field">Tag
+      <select><option>All tags</option></select>
+    </label>
+    <label class="toolbar-field">Sort
+      <select><option>Manual order</option></select>
+    </label>
+  </div>
+  <div>
+    <div class="group">
+      <div class="group-title">Kitchen</div>
+      <div class="task chore-row" data-open-editor>
+        <div class="task-body">
+          <div class="task-text">Wipe counters</div>
+          <div class="task-when">every day</div>
+        </div>
+        <div class="next-due">
+          <span class="next-due-label">Next</span>
+          <span class="next-due-date">Today</span>
+        </div>
+        <div class="row-actions">
+          <button type="button">↑</button><button type="button">↓</button><button class="edit-row-btn" type="button">Edit</button>
+        </div>
+      </div>
+      <div class="task chore-row" data-open-editor>
+        <div class="task-body">
+          <div class="task-text">Take out trash</div>
+          <div class="task-when">every week on Mon, Thu</div>
+          <div class="task-meta">
+            <span class="assignee-pill">Sam</span>
+            <span class="tag-pill">#trash</span>
+          </div>
+        </div>
+        <div class="next-due">
+          <span class="next-due-label">Next</span>
+          <span class="next-due-date">Today</span>
+        </div>
+        <div class="row-actions">
+          <button type="button">↑</button><button type="button">↓</button><button class="edit-row-btn" type="button">Edit</button>
+        </div>
+      </div>
+      <div class="task chore-row" data-open-editor>
+        <div class="task-body">
+          <div class="task-text">Deep clean the oven</div>
+          <div class="task-when">every year</div>
+        </div>
+        <div class="next-due flex-next">
+          <span class="next-due-label">Flexible</span>
+          <span class="flex-scope">This year</span>
+        </div>
+        <div class="row-actions">
+          <button type="button">↑</button><button type="button">↓</button><button class="edit-row-btn" type="button">Edit</button>
+        </div>
+      </div>
+    </div>
+    <div class="group">
+      <div class="group-title">Pool</div>
+      <div class="task chore-row" data-open-editor>
+        <div class="task-body">
+          <div class="task-text">Skim the pool</div>
+          <div class="task-when">every day</div>
+          <div class="task-meta">
+            <span class="prio-flag">High priority</span>
+            <span class="tag-pill">#outdoor</span>
+          </div>
+        </div>
+        <div class="next-due">
+          <span class="next-due-label">Next</span>
+          <span class="next-due-date">Today</span>
+        </div>
+        <div class="row-actions">
+          <button type="button">↑</button><button type="button">↓</button><button class="edit-row-btn" type="button">Edit</button>
+        </div>
+      </div>
+    </div>
+    <div class="group">
+      <div class="group-title">Garage</div>
+      <div class="task chore-row" data-open-editor>
+        <div class="task-body">
+          <div class="task-text">Clean out the car</div>
+          <div class="task-when">every month</div>
+          <div class="task-meta">
+            <span class="assignee-pill">Alex</span>
+            <span class="tag-pill">#outdoor</span>
+          </div>
+        </div>
+        <div class="next-due flex-next">
+          <span class="next-due-label">Flexible</span>
+          <span class="flex-scope">This month</span>
+        </div>
+        <div class="row-actions">
+          <button type="button">↑</button><button type="button">↓</button><button class="edit-row-btn" type="button">Edit</button>
+        </div>
+      </div>
+    </div>
+    <div class="group">
+      <div class="group-title">House</div>
+      <div class="task chore-row" data-open-editor>
+        <div class="task-body">
+          <div class="task-text">Wash windows</div>
+          <div class="task-when">once</div>
+          <div class="task-meta">
+            <span class="assignee-pill">Sam</span>
+          </div>
+        </div>
+        <div class="next-due flex-next">
+          <span class="next-due-label">Flexible</span>
+          <span class="flex-scope">This week</span>
+        </div>
+        <div class="row-actions">
+          <button type="button">↑</button><button type="button">↓</button><button class="edit-row-btn" type="button">Edit</button>
+        </div>
+      </div>
+      <div class="task chore-row" data-open-editor>
+        <div class="task-body">
+          <div class="task-text">Donate old coats</div>
+          <div class="task-when">once</div>
+          <div class="task-meta">
+            <span class="assignee-pill">Riley</span>
+            <span class="tag-pill">#donation</span>
+          </div>
+        </div>
+        <div class="next-due flex-next">
+          <span class="next-due-label">Flexible</span>
+          <span class="flex-scope">Anytime</span>
+        </div>
+        <div class="row-actions">
+          <button type="button">↑</button><button type="button">↓</button><button class="edit-row-btn" type="button">Edit</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="legend">Flexible chores stay out of the dated calendar; their period pill says when they belong.</div>
+
+<div class="scrim" id="scrim" hidden></div>
+<div class="sheet" id="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+  <div class="sheet-head">
+    <h2 id="sheetTitle">Edit chore</h2>
+    <button class="x" type="button" data-close-editor aria-label="Close">&times;</button>
+  </div>
+  <div class="sheet-body">
+    <label class="field">Name
+      <input type="text" value="Clean out the car">
+    </label>
+    <label class="field">Area
+      <input type="text" value="Garage">
+    </label>
+    <label class="field">Assigned to
+      <input type="text" value="Alex">
+    </label>
+    <div class="field">
+      <span class="field-label">Tags</span>
+      <div class="tag-editor">
+        <div class="tag-chips">
+          <span class="tag-chip">outdoor <button class="tag-remove" type="button">×</button></span>
+        </div>
+        <div class="tag-input-row">
+          <input type="text" placeholder="Add a tag, then press Enter">
+          <button class="chip add-tag-btn" type="button">Add</button>
+        </div>
+      </div>
+    </div>
+    <label class="priority-field">
+      <input type="checkbox">
+      <span>
+        <strong>High priority</strong>
+        <span class="field-hint">Only high-priority overdue chores appear in the banner; all overdue chores show in red.</span>
+      </span>
+    </label>
+
+    <div class="divider-label">Timing</div>
+    <div class="timing-switch" id="timingSwitch" role="group" aria-label="Due timing">
+      <button class="timing-btn" data-timing="date" type="button">On a date</button>
+      <button class="timing-btn active" data-timing="flex" type="button">Flexible</button>
+    </div>
+
+    <div class="date-schedule" id="dateSchedule" hidden>
+      <label class="field">Repeats
+        <select>
+          <option>Weekly</option>
+          <option>Monthly</option>
+          <option>Yearly</option>
+        </select>
+      </label>
+      <span class="field-hint">The existing dated schedule controls would appear here.</span>
+    </div>
+
+    <div class="flex-editor" id="flexSchedule">
+      <div class="field">
+        <span class="field-label">Window</span>
+        <div class="chips">
+          <button class="chip" data-window="anytime" type="button">Anytime</button>
+          <button class="chip" data-window="week" type="button">Week</button>
+          <button class="chip active" data-window="month" type="button">Month</button>
+          <button class="chip" data-window="year" type="button">Year</button>
+        </div>
+      </div>
+      <label class="field">Repeats
+        <select id="flexRepeat">
+          <option>Doesn't repeat</option>
+          <option selected>Every month</option>
+          <option>Every 2 months</option>
+          <option>Every 3 months</option>
+        </select>
+      </label>
+      <span class="field-hint" id="flexHint">Appears in Flexible until done, then resets on the 1st of each month.</span>
+    </div>
+  </div>
+  <div class="sheet-foot">
+    <button class="danger" type="button">Delete</button>
+    <div class="spacer"></div>
+    <button type="button" data-close-editor>Cancel</button>
+    <button class="primary" type="button" data-close-editor>Save</button>
+  </div>
+</div>
+
+<script>
+/* ---- mockup interaction only ---- */
+const surfaces = document.querySelectorAll('.surface-btn');
+surfaces.forEach(btn => btn.addEventListener('click', () => {
+  surfaces.forEach(b => {
+    const on = b === btn;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  document.getElementById('calendarSurface').hidden = btn.dataset.surface !== 'calendar';
+  document.getElementById('choresSurface').hidden = btn.dataset.surface !== 'chores';
+}));
+
+const viewButtons = document.querySelectorAll('.view-btn');
+viewButtons.forEach(btn => btn.addEventListener('click', () => {
+  viewButtons.forEach(b => {
+    const on = b === btn;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  const month = btn.dataset.view === 'month';
+  document.getElementById('weekGrid').hidden = month;
+  document.getElementById('monthGrid').hidden = !month;
+  document.getElementById('rangeLabel').textContent = month ? 'November 2026' : 'Nov 1 – Nov 7, 2026';
+}));
+
+/* week strip */
+const week = [
+  ['SUN', 1, '0/2', 1, 'overdue'],
+  ['MON', 2, '0/3', 0, 'pending'],
+  ['TUE', 3, '0/2', 0, 'pending'],
+  ['WED', 4, '0/2', 0, 'pending'],
+  ['THU', 5, '1/3', 0, 'pending'],
+  ['FRI', 6, '0/2', 0, 'pending'],
+  ['SAT', 7, '0/2', 0, 'pending'],
+];
+const weekGrid = document.getElementById('weekGrid');
+week.forEach(([dow, day, count, overdue, stripe], idx) => {
+  const col = document.createElement('button');
+  col.type = 'button';
+  col.className = 'day-col' + (idx === 0 ? ' has-overdue' : '') + (idx === 4 ? ' today selected' : '');
+  col.innerHTML = `
+    <div class="day-col-head"><span class="dow">${dow}</span><span class="day-num">${day}</span></div>
+    <span class="day-count">${count}</span>
+    ${overdue ? `<span class="od-badge">${overdue}</span>` : ''}
+    <span class="day-stripe stripe-${stripe}"></span>`;
+  weekGrid.appendChild(col);
+});
+
+/* month grid (static, for layout review) */
+const monthGrid = document.getElementById('monthGrid');
+const heads = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+heads.forEach(h => {
+  const d = document.createElement('div');
+  d.className = 'dow-head';
+  d.textContent = h;
+  monthGrid.appendChild(d);
+});
+const counts = { 1: '0/2', 2: '0/3', 3: '1/2', 4: '0/2', 5: '1/3', 7: '0/2', 8: '0/1', 10: '0/2', 12: '0/1', 15: '0/2', 18: '0/1', 22: '0/2', 26: '0/1', 29: '0/2' };
+const overdueDays = new Set([1]);
+for (let i = 0; i < 35; i++) {
+  const dayNum = i + 1;
+  const cell = document.createElement('button');
+  cell.type = 'button';
+  const inMonth = dayNum <= 30;
+  cell.className = 'day-cell' + (inMonth ? '' : ' other-month') +
+    (dayNum === 5 ? ' today selected' : '') + (overdueDays.has(dayNum) ? ' has-overdue' : '');
+  const shown = inMonth ? dayNum : dayNum - 30;
+  cell.innerHTML = `<span class="day-num">${shown}</span>` +
+    (inMonth && counts[dayNum] ? `<span class="day-count">${counts[dayNum]}</span>` : '') +
+    (overdueDays.has(dayNum) ? '<span class="od-badge">1</span>' : '') +
+    (inMonth ? `<span class="day-stripe stripe-${overdueDays.has(dayNum) ? 'overdue' : (counts[dayNum] && counts[dayNum].startsWith('1/') ? 'done' : 'pending')}"></span>` : '');
+  monthGrid.appendChild(cell);
+}
+
+/* flexible checkbox state */
+document.querySelectorAll('.flex-item input').forEach(cb => {
+  cb.addEventListener('change', () => cb.closest('.flex-item').classList.toggle('done', cb.checked));
+});
+
+/* editor */
+const scrim = document.getElementById('scrim');
+const sheet = document.getElementById('sheet');
+function openEditor() { scrim.hidden = false; sheet.hidden = false; }
+function closeEditor() { scrim.hidden = true; sheet.hidden = true; }
+document.querySelectorAll('[data-open-editor]').forEach(n => n.addEventListener('click', openEditor));
+document.querySelectorAll('[data-close-editor]').forEach(n => n.addEventListener('click', closeEditor));
+scrim.addEventListener('click', closeEditor);
+
+const timingButtons = document.querySelectorAll('.timing-btn');
+timingButtons.forEach(btn => btn.addEventListener('click', () => {
+  timingButtons.forEach(b => b.classList.toggle('active', b === btn));
+  document.getElementById('dateSchedule').hidden = btn.dataset.timing !== 'date';
+  document.getElementById('flexSchedule').hidden = btn.dataset.timing !== 'flex';
+}));
+
+const windowButtons = document.querySelectorAll('[data-window]');
+const repeat = document.getElementById('flexRepeat');
+const hint = document.getElementById('flexHint');
+windowButtons.forEach(btn => btn.addEventListener('click', () => {
+  windowButtons.forEach(b => b.classList.toggle('active', b === btn));
+  const w = btn.dataset.window;
+  if (w === 'anytime') {
+    repeat.value = "Doesn't repeat";
+    repeat.disabled = true;
+    hint.textContent = 'Stays in Flexible until it is checked off.';
+  } else {
+    repeat.disabled = false;
+    repeat.value = 'Every ' + w;
+    hint.textContent = 'Appears in Flexible until done, then resets at the start of each ' + w + '.';
+  }
+}));
+</script>
+</body>
+</html>
